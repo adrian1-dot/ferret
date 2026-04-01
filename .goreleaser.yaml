@@ -23,7 +23,7 @@ builds:
 
 archives:
   - id: ferret
-    builds:
+    ids:
       - ferret
     name_template: "{{ .ProjectName }}_{{ .Os }}_{{ .Arch }}"
     format_overrides:
