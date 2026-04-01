@@ -8,8 +8,6 @@ import (
 	"path/filepath"
 	"slices"
 	"strings"
-	"syscall"
-	"time"
 
 	"github.com/adrian1-dot/ferret/internal/fsutil"
 	"gopkg.in/yaml.v3"
@@ -136,18 +134,11 @@ func (s FileStore) Save(_ context.Context, cfg *Config) error {
 func (s FileStore) Update(ctx context.Context, mutate func(*Config) error) error {
 	path := s.path()
 	lockPath := path + ".lock"
-	if err := os.MkdirAll(filepath.Dir(lockPath), 0o755); err != nil {
-		return err
-	}
-	lockFile, err := os.OpenFile(lockPath, os.O_CREATE|os.O_RDWR, 0o644)
+	lockFile, err := acquireLock(ctx, lockPath)
 	if err != nil {
 		return err
 	}
-	defer lockFile.Close()
-	if err := lockWithContext(ctx, lockFile); err != nil {
-		return err
-	}
-	defer syscall.Flock(int(lockFile.Fd()), syscall.LOCK_UN)
+	defer releaseLock(lockFile)
 
 	cfg, err := s.Load(ctx)
 	if err != nil {
@@ -183,23 +174,6 @@ func ExpandPath(path string) string {
 		}
 	}
 	return path
-}
-
-func lockWithContext(ctx context.Context, f *os.File) error {
-	for {
-		err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB)
-		if err == nil {
-			return nil
-		}
-		if !errors.Is(err, syscall.EWOULDBLOCK) {
-			return err
-		}
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case <-time.After(10 * time.Millisecond):
-		}
-	}
 }
 
 func Validate(cfg *Config) error {
