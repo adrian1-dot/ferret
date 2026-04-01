@@ -52,24 +52,25 @@ type IssueSnapshot struct {
 }
 
 type PRSnapshot struct {
-	Owner          string     `json:"owner"`
-	Repo           string     `json:"repo"`
-	Number         int        `json:"number"`
-	Title          string     `json:"title"`
-	URL            string     `json:"url"`
-	State          string     `json:"state"`
-	Author         string     `json:"author"`
-	MergedBy       string     `json:"merged_by,omitempty"`
-	ClosingIssues  []int      `json:"closing_issues,omitempty"`
-	Assignees      []string   `json:"assignees"`
-	IsDraft        bool       `json:"is_draft"`
-	ReviewDecision string     `json:"review_decision"`
-	BoardStatus    string     `json:"board_status,omitempty"`
-	CreatedAt      time.Time  `json:"created_at"`
-	UpdatedAt      time.Time  `json:"updated_at"`
-	ClosedAt       *time.Time `json:"closed_at,omitempty"`
-	MergedAt       *time.Time `json:"merged_at,omitempty"`
-	Repository     string     `json:"repository"`
+	Owner              string     `json:"owner"`
+	Repo               string     `json:"repo"`
+	Number             int        `json:"number"`
+	Title              string     `json:"title"`
+	URL                string     `json:"url"`
+	State              string     `json:"state"`
+	Author             string     `json:"author"`
+	MergedBy           string     `json:"merged_by,omitempty"`
+	ClosingIssues      []int      `json:"closing_issues,omitempty"`
+	Assignees          []string   `json:"assignees"`
+	RequestedReviewers []string   `json:"requested_reviewers,omitempty"`
+	IsDraft            bool       `json:"is_draft"`
+	ReviewDecision     string     `json:"review_decision"`
+	BoardStatus        string     `json:"board_status,omitempty"`
+	CreatedAt          time.Time  `json:"created_at"`
+	UpdatedAt          time.Time  `json:"updated_at"`
+	ClosedAt           *time.Time `json:"closed_at,omitempty"`
+	MergedAt           *time.Time `json:"merged_at,omitempty"`
+	Repository         string     `json:"repository"`
 }
 
 type WorkflowSnapshot struct {

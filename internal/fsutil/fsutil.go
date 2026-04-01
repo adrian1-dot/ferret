@@ -75,6 +75,33 @@ func ResolveSafeWritePath(path, root string) (string, error) {
 	return absPath, nil
 }
 
+// ResolveApprovedWritePath resolves path and verifies that it stays under root.
+// Relative paths are interpreted relative to the current working directory.
+func ResolveApprovedWritePath(path, root string) (string, error) {
+	if path == "" {
+		return "", fmt.Errorf("fsutil: empty path")
+	}
+	absPath, err := filepath.Abs(path)
+	if err != nil {
+		return "", fmt.Errorf("fsutil: absolute path for %q: %w", path, err)
+	}
+	absRoot, err := filepath.Abs(root)
+	if err != nil {
+		return "", fmt.Errorf("fsutil: absolute root for %q: %w", root, err)
+	}
+	if err := os.MkdirAll(absRoot, 0o755); err != nil {
+		return "", fmt.Errorf("fsutil: create root %s: %w", absRoot, err)
+	}
+	rel, err := filepath.Rel(absRoot, absPath)
+	if err != nil {
+		return "", fmt.Errorf("fsutil: relative path from %s to %s: %w", absRoot, absPath, err)
+	}
+	if rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+		return "", fmt.Errorf("fsutil: path %q escapes approved root %q", path, root)
+	}
+	return ResolveSafeWritePath(rel, absRoot)
+}
+
 // checkSymlinkEscape evaluates symlinks for each directory component of path
 // that is a subdirectory of root (i.e. after we have passed root in the walk),
 // verifying that no symlink leads outside root.

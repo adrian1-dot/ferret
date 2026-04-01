@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 
+	"github.com/adrian1-dot/ferret/internal/fsutil"
 	"gopkg.in/yaml.v3"
 )
 
@@ -56,25 +57,23 @@ func (s FileStateStore) Save(_ context.Context, state *State) error {
 		state.Cursors = map[string]string{}
 	}
 	path := s.path()
-	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
-		return err
-	}
 	data, err := yaml.Marshal(state)
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(path, data, 0o644)
+	return fsutil.AtomicWriteFile(path, data)
 }
 
 func (s FileStateStore) path() string {
 	if s.Path == "" {
-		return DefaultStatePath
+		return ExpandPath(DefaultStatePath)
 	}
-	return s.Path
+	return ExpandPath(s.Path)
 }
 
 func StatePathForConfig(configPath string) string {
-	if configPath == "" || configPath == DefaultConfigPath {
+	configPath = ExpandPath(configPath)
+	if configPath == "" || configPath == ExpandPath(DefaultConfigPath) {
 		return DefaultStatePath
 	}
 	return filepath.Join(filepath.Dir(configPath), "state.yaml")

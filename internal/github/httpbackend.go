@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -72,6 +73,94 @@ func (b *HTTPBackend) GetRepo(ctx context.Context, owner, repo string) (domain.R
 		UpdatedAt:  out.UpdatedAt,
 		DefaultRef: out.DefaultBranch,
 	}, nil
+}
+
+func (b *HTTPBackend) GetIssue(ctx context.Context, owner, repo string, number int) (domain.IssueSnapshot, error) {
+	var out struct {
+		Number      int        `json:"number"`
+		Title       string     `json:"title"`
+		HTMLURL     string     `json:"html_url"`
+		State       string     `json:"state"`
+		Body        string     `json:"body"`
+		CreatedAt   time.Time  `json:"created_at"`
+		UpdatedAt   time.Time  `json:"updated_at"`
+		ClosedAt    *time.Time `json:"closed_at"`
+		PullRequest any        `json:"pull_request"`
+		User        struct {
+			Login string `json:"login"`
+		} `json:"user"`
+		Assignees []struct {
+			Login string `json:"login"`
+		} `json:"assignees"`
+		Labels []struct {
+			Name string `json:"name"`
+		} `json:"labels"`
+	}
+	if err := b.get(ctx, &out, fmt.Sprintf("/repos/%s/%s/issues/%d", owner, repo, number)); err != nil {
+		return domain.IssueSnapshot{}, err
+	}
+	issue := domain.IssueSnapshot{
+		Owner: owner, Repo: repo, Number: out.Number, Title: out.Title, URL: out.HTMLURL,
+		State: out.State, Author: out.User.Login, Body: out.Body, CreatedAt: out.CreatedAt,
+		UpdatedAt: out.UpdatedAt, ClosedAt: out.ClosedAt, Repository: owner + "/" + repo,
+	}
+	for _, a := range out.Assignees {
+		issue.Assignees = append(issue.Assignees, a.Login)
+	}
+	for _, l := range out.Labels {
+		issue.Labels = append(issue.Labels, l.Name)
+	}
+	return issue, nil
+}
+
+func (b *HTTPBackend) GetPullRequest(ctx context.Context, owner, repo string, number int) (domain.PRSnapshot, error) {
+	var out struct {
+		Number    int        `json:"number"`
+		Title     string     `json:"title"`
+		HTMLURL   string     `json:"html_url"`
+		State     string     `json:"state"`
+		Body      string     `json:"body"`
+		Draft     bool       `json:"draft"`
+		CreatedAt time.Time  `json:"created_at"`
+		UpdatedAt time.Time  `json:"updated_at"`
+		ClosedAt  *time.Time `json:"closed_at"`
+		MergedAt  *time.Time `json:"merged_at"`
+		User      struct {
+			Login string `json:"login"`
+		} `json:"user"`
+		MergedBy *struct {
+			Login string `json:"login"`
+		} `json:"merged_by"`
+		Assignees []struct {
+			Login string `json:"login"`
+		} `json:"assignees"`
+		RequestedReviewers []struct {
+			Login string `json:"login"`
+		} `json:"requested_reviewers"`
+	}
+	if err := b.get(ctx, &out, fmt.Sprintf("/repos/%s/%s/pulls/%d", owner, repo, number)); err != nil {
+		return domain.PRSnapshot{}, err
+	}
+	pr := domain.PRSnapshot{
+		Owner: owner, Repo: repo, Number: out.Number, Title: out.Title, URL: out.HTMLURL,
+		State: out.State, Author: out.User.Login, IsDraft: out.Draft,
+		CreatedAt: out.CreatedAt, UpdatedAt: out.UpdatedAt,
+		ClosedAt: out.ClosedAt, MergedAt: out.MergedAt,
+		Repository: owner + "/" + repo,
+	}
+	if out.MergedBy != nil {
+		pr.MergedBy = out.MergedBy.Login
+	}
+	for _, a := range out.Assignees {
+		pr.Assignees = append(pr.Assignees, a.Login)
+	}
+	for _, rr := range out.RequestedReviewers {
+		if rr.Login == "" {
+			continue
+		}
+		pr.RequestedReviewers = append(pr.RequestedReviewers, rr.Login)
+	}
+	return pr, nil
 }
 
 func (b *HTTPBackend) ListUserRecentRepos(ctx context.Context, limit int) ([]domain.RepoSnapshot, error) {
@@ -160,7 +249,6 @@ func (b *HTTPBackend) ListRepoIssues(ctx context.Context, owner, repo string, q 
 // which is not available from the REST list endpoint.
 func (b *HTTPBackend) ListRepoPRs(ctx context.Context, owner, repo string, q PRQuery) ([]domain.PRSnapshot, error) {
 	states := prStates(defaultString(q.State, "open"))
-
 	var viewer string
 	if q.Review {
 		var err error
@@ -181,7 +269,14 @@ query($owner: String!, $repo: String!, $states: [PullRequestState!], $after: Str
         author { login }
         mergedBy { login }
         assignees(first: 20) { nodes { login } }
-        requestedReviewers { nodes { ... on User { login } } }
+        reviewRequests(first: 20) {
+          nodes {
+            requestedReviewer {
+              __typename
+              ... on User { login }
+            }
+          }
+        }
         closingIssuesReferences(first: 10) { nodes { number } }
       }
     }
@@ -210,11 +305,14 @@ query($owner: String!, $repo: String!, $states: [PullRequestState!], $after: Str
 				Login string `json:"login"`
 			} `json:"nodes"`
 		} `json:"assignees"`
-		RequestedReviewers struct {
+		ReviewRequests struct {
 			Nodes []struct {
-				Login string `json:"login"`
+				RequestedReviewer struct {
+					TypeName string `json:"__typename"`
+					Login    string `json:"login"`
+				} `json:"requestedReviewer"`
 			} `json:"nodes"`
-		} `json:"requestedReviewers"`
+		} `json:"reviewRequests"`
 		ClosingIssuesReferences struct {
 			Nodes []struct {
 				Number int `json:"number"`
@@ -247,6 +345,9 @@ query($owner: String!, $repo: String!, $states: [PullRequestState!], $after: Str
 		}
 		var resp response
 		if err := b.graphQL(ctx, &resp, query, vars); err != nil {
+			if shouldFallbackRepoPRs(err) {
+				return b.listRepoPRsRESTFallback(ctx, owner, repo, q, viewer)
+			}
 			return nil, err
 		}
 		page := resp.Data.Repository.PullRequests
@@ -260,18 +361,6 @@ query($owner: String!, $repo: String!, $states: [PullRequestState!], $after: Str
 
 	var prs []domain.PRSnapshot
 	for _, node := range allNodes {
-		if q.Review && viewer != "" {
-			requested := false
-			for _, rr := range node.RequestedReviewers.Nodes {
-				if strings.EqualFold(rr.Login, viewer) {
-					requested = true
-					break
-				}
-			}
-			if !requested {
-				continue
-			}
-		}
 		pr := domain.PRSnapshot{
 			Owner: owner, Repo: repo, Number: node.Number, Title: node.Title, URL: node.URL,
 			State: node.State, Author: node.Author.Login, IsDraft: node.IsDraft,
@@ -283,15 +372,119 @@ query($owner: String!, $repo: String!, $states: [PullRequestState!], $after: Str
 		for _, a := range node.Assignees.Nodes {
 			pr.Assignees = append(pr.Assignees, a.Login)
 		}
+		for _, rr := range node.ReviewRequests.Nodes {
+			if rr.RequestedReviewer.TypeName != "User" || rr.RequestedReviewer.Login == "" {
+				continue
+			}
+			pr.RequestedReviewers = append(pr.RequestedReviewers, rr.RequestedReviewer.Login)
+		}
 		for _, ci := range node.ClosingIssuesReferences.Nodes {
 			pr.ClosingIssues = append(pr.ClosingIssues, ci.Number)
 		}
 		if !withinSince(q.Since, pr.UpdatedAt, pr.CreatedAt, pr.ClosedAt, pr.MergedAt) {
 			continue
 		}
+		if q.Review && !containsFold(pr.RequestedReviewers, viewer) {
+			continue
+		}
 		prs = append(prs, pr)
 	}
 	return prs, nil
+}
+
+func (b *HTTPBackend) listRepoPRsRESTFallback(ctx context.Context, owner, repo string, q PRQuery, viewer string) ([]domain.PRSnapshot, error) {
+	state := strings.ToLower(defaultString(q.State, "open"))
+	restState := state
+	if state == "merged" {
+		restState = "closed"
+	}
+	path := fmt.Sprintf("/repos/%s/%s/pulls?state=%s&sort=updated&direction=desc&per_page=100", owner, repo, restState)
+	var out []struct {
+		Number    int        `json:"number"`
+		Title     string     `json:"title"`
+		HTMLURL   string     `json:"html_url"`
+		State     string     `json:"state"`
+		Draft     bool       `json:"draft"`
+		CreatedAt time.Time  `json:"created_at"`
+		UpdatedAt time.Time  `json:"updated_at"`
+		ClosedAt  *time.Time `json:"closed_at"`
+		MergedAt  *time.Time `json:"merged_at"`
+		User      struct {
+			Login string `json:"login"`
+		} `json:"user"`
+		MergedBy *struct {
+			Login string `json:"login"`
+		} `json:"merged_by"`
+		Assignees []struct {
+			Login string `json:"login"`
+		} `json:"assignees"`
+		RequestedReviewers []struct {
+			Login string `json:"login"`
+		} `json:"requested_reviewers"`
+	}
+	if err := b.getPaged(ctx, &out, path); err != nil {
+		return nil, err
+	}
+	var prs []domain.PRSnapshot
+	for _, item := range out {
+		if state == "merged" && item.MergedAt == nil {
+			continue
+		}
+		pr := domain.PRSnapshot{
+			Owner: owner, Repo: repo, Number: item.Number, Title: item.Title, URL: item.HTMLURL,
+			State: item.State, Author: item.User.Login, IsDraft: item.Draft,
+			CreatedAt: item.CreatedAt, UpdatedAt: item.UpdatedAt,
+			ClosedAt: item.ClosedAt, MergedAt: item.MergedAt,
+			Repository: owner + "/" + repo,
+		}
+		if item.MergedBy != nil {
+			pr.MergedBy = item.MergedBy.Login
+		}
+		for _, a := range item.Assignees {
+			pr.Assignees = append(pr.Assignees, a.Login)
+		}
+		for _, rr := range item.RequestedReviewers {
+			if rr.Login == "" {
+				continue
+			}
+			pr.RequestedReviewers = append(pr.RequestedReviewers, rr.Login)
+		}
+		if !withinSince(q.Since, pr.UpdatedAt, pr.CreatedAt, pr.ClosedAt, pr.MergedAt) {
+			continue
+		}
+		if q.Review && !containsFold(pr.RequestedReviewers, viewer) {
+			continue
+		}
+		prs = append(prs, pr)
+	}
+	return prs, nil
+}
+
+func containsFold(values []string, want string) bool {
+	for _, value := range values {
+		if strings.EqualFold(value, want) {
+			return true
+		}
+	}
+	return false
+}
+
+func shouldFallbackRepoPRs(err error) bool {
+	if err == nil || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return false
+	}
+	if IsKind(err, ErrAuth) || IsKind(err, ErrMissingScope) || IsKind(err, ErrNotFound) || IsKind(err, ErrRateLimited) {
+		return false
+	}
+	var ghErr *Error
+	if errors.As(err, &ghErr) {
+		return strings.Contains(ghErr.Message, "HTTP 500") ||
+			strings.Contains(ghErr.Message, "HTTP 502") ||
+			strings.Contains(ghErr.Message, "HTTP 503") ||
+			strings.Contains(ghErr.Message, "HTTP 504")
+	}
+	msg := err.Error()
+	return strings.HasPrefix(msg, "GraphQL: ")
 }
 
 func (b *HTTPBackend) ListWorkflowRuns(ctx context.Context, owner, repo string, q WorkflowQuery) ([]domain.WorkflowSnapshot, error) {

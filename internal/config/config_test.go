@@ -2,8 +2,10 @@ package config
 
 import (
 	"context"
+	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 )
 
@@ -115,5 +117,48 @@ func TestFileStateStoreRoundTrip(t *testing.T) {
 	}
 	if got.Cursors["catch-up:all"] != "2026-03-28T10:00:00Z" {
 		t.Fatalf("unexpected cursors: %#v", got.Cursors)
+	}
+}
+
+func TestExpandPathExpandsTildePrefix(t *testing.T) {
+	t.Parallel()
+	home, err := os.UserHomeDir()
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := ExpandPath("~/ferret/config.yaml")
+	want := filepath.Join(home, "ferret", "config.yaml")
+	if got != want {
+		t.Fatalf("expected %q, got %q", want, got)
+	}
+}
+
+func TestFileStoreUpdateSerializesConcurrentMutations(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	store := FileStore{Path: filepath.Join(dir, "config.yaml")}
+
+	aliases := []string{"api", "web", "atlas", "ferret"}
+	var wg sync.WaitGroup
+	for _, alias := range aliases {
+		alias := alias
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if err := store.Update(context.Background(), func(cfg *Config) error {
+				return AddRepoWatch(cfg, RepoWatch{Alias: alias, Owner: "acme", Name: alias})
+			}); err != nil {
+				t.Errorf("update %s: %v", alias, err)
+			}
+		}()
+	}
+	wg.Wait()
+
+	cfg, err := store.Load(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(cfg.Watch.Repos) != len(aliases) {
+		t.Fatalf("expected %d repos after concurrent updates, got %#v", len(aliases), cfg.Watch.Repos)
 	}
 }

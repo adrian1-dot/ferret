@@ -362,3 +362,69 @@ func TestTextRendererRenderManagerStructuredSections(t *testing.T) {
 		t.Fatalf("unexpected manager render: %q", out)
 	}
 }
+
+func TestManagerSummaryLinesPrefersBoardScopedKeys(t *testing.T) {
+	t.Parallel()
+	lines := managerSummaryLines(map[string]int{
+		"total":           5,
+		"board_ready":     2,
+		"board_in_review": 1,
+		"board_unknown":   2,
+		"review_needed":   3,
+		"workflow_runs":   1,
+	})
+	got := strings.Join(lines, "\n")
+	if !strings.Contains(got, "board_ready: 2") || !strings.Contains(got, "board_in_review: 1") {
+		t.Fatalf("expected board summary keys, got %q", got)
+	}
+	if strings.Index(got, "review_needed: 3") > strings.Index(got, "board_ready: 2") {
+		t.Fatalf("expected review_needed to appear before board buckets, got %q", got)
+	}
+}
+
+func TestTextRendererRenderIssueInspect(t *testing.T) {
+	t.Parallel()
+	var buf strings.Builder
+	err := TextRenderer{}.RenderIssueInspect(&buf, domain.IssueSnapshot{
+		Owner:     "acme",
+		Repo:      "api",
+		Number:    42,
+		Title:     "Fix auth",
+		URL:       "https://example.com/issues/42",
+		State:     "OPEN",
+		Author:    "alice",
+		Assignees: []string{"bob"},
+		Labels:    []string{"bug"},
+		UpdatedAt: time.Date(2026, 4, 1, 9, 0, 0, 0, time.UTC),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	out := buf.String()
+	if !strings.Contains(out, "Issue: acme/api#42") || !strings.Contains(out, "Assignees: bob") {
+		t.Fatalf("unexpected issue inspect render: %q", out)
+	}
+}
+
+func TestTextRendererRenderPRInspect(t *testing.T) {
+	t.Parallel()
+	var buf strings.Builder
+	err := TextRenderer{}.RenderPRInspect(&buf, domain.PRSnapshot{
+		Owner:              "acme",
+		Repo:               "api",
+		Number:             7,
+		Title:              "Add feature",
+		URL:                "https://example.com/pulls/7",
+		State:              "OPEN",
+		Author:             "alice",
+		RequestedReviewers: []string{"bob"},
+		UpdatedAt:          time.Date(2026, 4, 1, 10, 0, 0, 0, time.UTC),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	out := buf.String()
+	if !strings.Contains(out, "Pull Request: acme/api#7") || !strings.Contains(out, "Requested Reviewers: bob") {
+		t.Fatalf("unexpected pr inspect render: %q", out)
+	}
+}

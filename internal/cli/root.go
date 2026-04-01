@@ -11,6 +11,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/adrian1-dot/ferret/internal/auth"
@@ -24,8 +25,9 @@ import (
 )
 
 type rootOptions struct {
-	configPath string
-	format     string
+	configPath            string
+	format                string
+	allowOutsideWorkspace bool
 }
 
 type app struct {
@@ -36,13 +38,19 @@ type app struct {
 }
 
 type doctorReport struct {
-	TokenSource  string
+	TokenSource   string
 	Authenticated bool
-	Login        string
-	RepoScope    bool
-	ProjectScope bool
-	Warning      string
+	Login         string
+	RepoScope     bool
+	ProjectScope  bool
+	Warning       string
 }
+
+const (
+	maxReposInFlight           = 3
+	maxTopLevelFetchesPerRepo  = 4
+	maxPRReviewThreadsInFlight = 4
+)
 
 func NewRootCmd() *cobra.Command {
 	opts := &rootOptions{}
@@ -74,8 +82,9 @@ Add a GitHub Project later for board-aware summaries:
 
 Run ferret doctor to verify your local setup.`,
 	}
-	cmd.PersistentFlags().StringVar(&opts.configPath, "config", config.DefaultConfigPath, "config path")
+	cmd.PersistentFlags().StringVar(&opts.configPath, "config", config.DefaultConfigPath, "config path (defaults to .ferret/config.yaml; outside .ferret requires --allow-outside-workspace)")
 	cmd.PersistentFlags().StringVar(&opts.format, "format", "text", "output format: text|json|markdown")
+	cmd.PersistentFlags().BoolVar(&opts.allowOutsideWorkspace, "allow-outside-workspace", false, "allow config and output paths outside the approved .ferret workspace roots")
 
 	cmd.AddCommand(newAuthCmd(opts))
 	cmd.AddCommand(newInspectCmd(opts))
@@ -195,7 +204,7 @@ func newAuthCmd(_ *rootOptions) *cobra.Command {
 func newInspectCmd(opts *rootOptions) *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "inspect",
-		Short: "Show the raw structure of a watched repo or GitHub Project",
+		Short: "Show raw metadata for a watched repo, project, issue, or pull request",
 	}
 	projectCmd := &cobra.Command{
 		Use:   "project <owner>/<number>|<alias>",
@@ -209,6 +218,9 @@ func newInspectCmd(opts *rootOptions) *cobra.Command {
 			}
 			cfg, err := app.store.Load(ctx)
 			if err != nil {
+				return err
+			}
+			if err := validateTrustedConfigPaths(cfg, opts.allowOutsideWorkspace); err != nil {
 				return err
 			}
 			owner, number, alias, err := resolveProjectRef(cfg, args[0])
@@ -238,6 +250,9 @@ func newInspectCmd(opts *rootOptions) *cobra.Command {
 			if err != nil {
 				return err
 			}
+			if err := validateTrustedConfigPaths(cfg, opts.allowOutsideWorkspace); err != nil {
+				return err
+			}
 			owner, repo, err := resolveRepoRef(cfg, args[0])
 			if err != nil {
 				return err
@@ -249,7 +264,63 @@ func newInspectCmd(opts *rootOptions) *cobra.Command {
 			return app.renderer.RenderRepoInspect(cmd.OutOrStdout(), snapshot)
 		},
 	}
-	cmd.AddCommand(projectCmd, repoCmd)
+	issueCmd := &cobra.Command{
+		Use:   "issue <owner>/<repo>#<number>|<alias>",
+		Short: "Show metadata about a watched or direct issue target",
+		Args:  cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			ctx := cmd.Context()
+			app, err := newApp(opts, cmd)
+			if err != nil {
+				return err
+			}
+			cfg, err := app.store.Load(ctx)
+			if err != nil {
+				return err
+			}
+			if err := validateTrustedConfigPaths(cfg, opts.allowOutsideWorkspace); err != nil {
+				return err
+			}
+			owner, repo, number, err := resolveItemRef(cfg, args[0], "issue")
+			if err != nil {
+				return err
+			}
+			issue, err := app.backend.GetIssue(ctx, owner, repo, number)
+			if err != nil {
+				return err
+			}
+			return app.renderer.RenderIssueInspect(cmd.OutOrStdout(), issue)
+		},
+	}
+	prCmd := &cobra.Command{
+		Use:   "pr <owner>/<repo>#<number>|<alias>",
+		Short: "Show metadata about a watched or direct pull request target",
+		Args:  cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			ctx := cmd.Context()
+			app, err := newApp(opts, cmd)
+			if err != nil {
+				return err
+			}
+			cfg, err := app.store.Load(ctx)
+			if err != nil {
+				return err
+			}
+			if err := validateTrustedConfigPaths(cfg, opts.allowOutsideWorkspace); err != nil {
+				return err
+			}
+			owner, repo, number, err := resolveItemRef(cfg, args[0], "pr")
+			if err != nil {
+				return err
+			}
+			pr, err := app.backend.GetPullRequest(ctx, owner, repo, number)
+			if err != nil {
+				return err
+			}
+			return app.renderer.RenderPRInspect(cmd.OutOrStdout(), pr)
+		},
+	}
+	cmd.AddCommand(projectCmd, repoCmd, issueCmd, prCmd)
 	return cmd
 }
 
@@ -279,27 +350,35 @@ func newWatchCmd(opts *rootOptions) *cobra.Command {
 			if err != nil {
 				return err
 			}
-			cfg, err := app.store.Load(ctx)
-			if err != nil {
-				return err
-			}
 			if _, err := app.backend.GetProjectSchema(ctx, owner, number); err != nil {
 				return err
 			}
-			if planFile == "" {
-				planFile = filepath.Join(cfg.Defaults.PlanDir, alias+".md")
-			}
-			if err := config.AddProjectWatch(cfg, config.ProjectWatch{
-				Alias: alias, Owner: owner, Number: number, LinkedRepos: linkedRepos,
-				StatusField: statusField, Output: config.ProjectOutput{PlanFile: planFile},
+			var resolvedPlanFile string
+			if err := app.store.Update(ctx, func(cfg *config.Config) error {
+				if err := validateTrustedConfigPaths(cfg, opts.allowOutsideWorkspace); err != nil {
+					return err
+				}
+				resolvedPlanFile = planFile
+				if resolvedPlanFile == "" {
+					resolvedPlanFile = filepath.Join(cfg.Defaults.PlanDir, alias+".md")
+				}
+				planRoot, err := approvedRoot(config.DefaultPlanDir)
+				if err != nil {
+					return err
+				}
+				resolvedPlanFile, err = secureOutputPath(resolvedPlanFile, planRoot, opts.allowOutsideWorkspace)
+				if err != nil {
+					return err
+				}
+				return config.AddProjectWatch(cfg, config.ProjectWatch{
+					Alias: alias, Owner: owner, Number: number, LinkedRepos: linkedRepos,
+					StatusField: statusField, Output: config.ProjectOutput{PlanFile: resolvedPlanFile},
+				})
 			}); err != nil {
 				return err
 			}
-			if err := app.store.Save(ctx, cfg); err != nil {
-				return err
-			}
 			_, _ = fmt.Fprintf(cmd.OutOrStdout(), "Watching project %s/%d as %q\n", owner, number, alias)
-			_, _ = fmt.Fprintf(cmd.OutOrStdout(), "Plan file: %s\n", planFile)
+			_, _ = fmt.Fprintf(cmd.OutOrStdout(), "Plan file: %s\n", resolvedPlanFile)
 			if statusField != "" {
 				_, _ = fmt.Fprintf(cmd.OutOrStdout(), "Status field: %s\n", statusField)
 			}
@@ -308,7 +387,7 @@ func newWatchCmd(opts *rootOptions) *cobra.Command {
 	}
 	projectCmd.Flags().StringVar(&alias, "alias", "", "local alias")
 	projectCmd.Flags().StringSliceVar(&linkedRepos, "link-repo", nil, "linked repo aliases")
-	projectCmd.Flags().StringVar(&planFile, "plan-file", "", "plan markdown path")
+	projectCmd.Flags().StringVar(&planFile, "plan-file", "", "plan markdown path under .ferret/plans/ by default")
 	projectCmd.Flags().StringVar(&statusField, "status-field", "", "project field name to use as board status (e.g. \"Status\")")
 
 	var repoAlias string
@@ -351,14 +430,12 @@ func newWatchCmd(opts *rootOptions) *cobra.Command {
 			if effectiveAlias == "" {
 				effectiveAlias = repo
 			}
-			cfg, err := app.store.Load(ctx)
-			if err != nil {
-				return err
-			}
-			if err := config.AddRepoWatch(cfg, config.RepoWatch{Alias: effectiveAlias, Owner: owner, Name: repo}); err != nil {
-				return err
-			}
-			if err := app.store.Save(ctx, cfg); err != nil {
+			if err := app.store.Update(ctx, func(cfg *config.Config) error {
+				if err := validateTrustedConfigPaths(cfg, opts.allowOutsideWorkspace); err != nil {
+					return err
+				}
+				return config.AddRepoWatch(cfg, config.RepoWatch{Alias: effectiveAlias, Owner: owner, Name: repo})
+			}); err != nil {
 				return err
 			}
 			_, _ = fmt.Fprintf(cmd.OutOrStdout(), "Watching repo %s/%s as %q\n", owner, repo, effectiveAlias)
@@ -378,6 +455,9 @@ func newWatchCmd(opts *rootOptions) *cobra.Command {
 			if err != nil {
 				return err
 			}
+			if err := validateTrustedConfigPaths(cfg, opts.allowOutsideWorkspace); err != nil {
+				return err
+			}
 			return renderWatchList(cmd.OutOrStdout(), cfg)
 		},
 	}
@@ -391,18 +471,31 @@ func newWatchCmd(opts *rootOptions) *cobra.Command {
 func newWatchItemCmd(opts *rootOptions, kind string) *cobra.Command {
 	var itemAlias string
 	cmd := &cobra.Command{
-		Use:   kind + " OWNER/REPO NUMBER [--alias name]",
+		Use:   kind + " OWNER/REPO NUMBER | OWNER/REPO#NUMBER [--alias name]",
 		Short: fmt.Sprintf("Watch a specific %s by OWNER/REPO and NUMBER", kind),
-		Args:  cobra.ExactArgs(2),
+		Args:  cobra.RangeArgs(1, 2),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			ctx := cmd.Context()
-			owner, repo, err := splitRepoRef(args[0])
-			if err != nil {
-				return err
-			}
-			number, err := strconv.Atoi(args[1])
-			if err != nil || number <= 0 {
-				return fmt.Errorf("NUMBER must be a positive integer, got %q", args[1])
+			var (
+				owner  string
+				repo   string
+				number int
+				err    error
+			)
+			if len(args) == 1 {
+				owner, repo, number, err = splitItemRef(args[0])
+				if err != nil {
+					return err
+				}
+			} else {
+				owner, repo, err = splitRepoRef(args[0])
+				if err != nil {
+					return err
+				}
+				number, err = strconv.Atoi(args[1])
+				if err != nil || number <= 0 {
+					return fmt.Errorf("NUMBER must be a positive integer, got %q", args[1])
+				}
 			}
 			if itemAlias == "" {
 				itemAlias = fmt.Sprintf("%s-%s-%d", owner, repo, number)
@@ -411,16 +504,14 @@ func newWatchItemCmd(opts *rootOptions, kind string) *cobra.Command {
 			if err != nil {
 				return err
 			}
-			cfg, err := app.store.Load(ctx)
-			if err != nil {
-				return err
-			}
-			if err := config.AddItemWatch(cfg, config.ItemWatch{
-				Alias: itemAlias, Owner: owner, Repo: repo, Number: number, Kind: kind,
+			if err := app.store.Update(ctx, func(cfg *config.Config) error {
+				if err := validateTrustedConfigPaths(cfg, opts.allowOutsideWorkspace); err != nil {
+					return err
+				}
+				return config.AddItemWatch(cfg, config.ItemWatch{
+					Alias: itemAlias, Owner: owner, Repo: repo, Number: number, Kind: kind,
+				})
 			}); err != nil {
-				return err
-			}
-			if err := app.store.Save(ctx, cfg); err != nil {
 				return err
 			}
 			_, _ = fmt.Fprintf(cmd.OutOrStdout(), "Watching %s %s/%s#%d as %q\n", kind, owner, repo, number, itemAlias)
@@ -440,17 +531,20 @@ func newUnwatchItemRunE(opts *rootOptions, kind string) func(*cobra.Command, []s
 		if err != nil {
 			return err
 		}
-		cfg, err := app.store.Load(ctx)
-		if err != nil {
-			return err
-		}
-		if len(args) == 1 {
-			// Single arg: treat as alias.
-			if err := config.RemoveItemWatch(cfg, args[0]); err != nil {
+		return app.store.Update(ctx, func(cfg *config.Config) error {
+			if err := validateTrustedConfigPaths(cfg, opts.allowOutsideWorkspace); err != nil {
 				return err
 			}
-		} else {
-			// Two args: OWNER/REPO NUMBER.
+			if len(args) == 1 {
+				if strings.Contains(args[0], "#") && strings.Contains(args[0], "/") {
+					owner, repo, number, err := splitItemRef(args[0])
+					if err != nil {
+						return err
+					}
+					return config.RemoveItemWatchByOwnerRepoNumber(cfg, owner, repo, number, kind)
+				}
+				return config.RemoveItemWatch(cfg, args[0])
+			}
 			owner, repo, err := splitRepoRef(args[0])
 			if err != nil {
 				return err
@@ -459,11 +553,8 @@ func newUnwatchItemRunE(opts *rootOptions, kind string) func(*cobra.Command, []s
 			if err != nil || number <= 0 {
 				return fmt.Errorf("NUMBER must be a positive integer, got %q", args[1])
 			}
-			if err := config.RemoveItemWatchByOwnerRepoNumber(cfg, owner, repo, number, kind); err != nil {
-				return err
-			}
-		}
-		return app.store.Save(ctx, cfg)
+			return config.RemoveItemWatchByOwnerRepoNumber(cfg, owner, repo, number, kind)
+		})
 	}
 }
 
@@ -481,16 +572,17 @@ func newUnwatchCmd(opts *rootOptions) *cobra.Command {
 			if err != nil {
 				return err
 			}
-			cfg, err := app.store.Load(cmd.Context())
-			if err != nil {
-				return err
-			}
-			for _, alias := range args {
-				if err := config.RemoveProjectWatch(cfg, alias); err != nil {
+			return app.store.Update(cmd.Context(), func(cfg *config.Config) error {
+				if err := validateTrustedConfigPaths(cfg, opts.allowOutsideWorkspace); err != nil {
 					return err
 				}
-			}
-			return app.store.Save(cmd.Context(), cfg)
+				for _, alias := range args {
+					if err := config.RemoveProjectWatch(cfg, alias); err != nil {
+						return err
+					}
+				}
+				return nil
+			})
 		},
 	}
 	repoCmd := &cobra.Command{
@@ -502,26 +594,27 @@ func newUnwatchCmd(opts *rootOptions) *cobra.Command {
 			if err != nil {
 				return err
 			}
-			cfg, err := app.store.Load(cmd.Context())
-			if err != nil {
-				return err
-			}
-			for _, alias := range args {
-				if err := config.RemoveRepoWatch(cfg, alias); err != nil {
+			return app.store.Update(cmd.Context(), func(cfg *config.Config) error {
+				if err := validateTrustedConfigPaths(cfg, opts.allowOutsideWorkspace); err != nil {
 					return err
 				}
-			}
-			return app.store.Save(cmd.Context(), cfg)
+				for _, alias := range args {
+					if err := config.RemoveRepoWatch(cfg, alias); err != nil {
+						return err
+					}
+				}
+				return nil
+			})
 		},
 	}
 	unwatchIssueCmd := &cobra.Command{
-		Use:   "issue <alias> | OWNER/REPO NUMBER",
+		Use:   "issue <alias> | OWNER/REPO NUMBER | OWNER/REPO#NUMBER",
 		Short: "Stop watching a specific issue",
 		Args:  cobra.RangeArgs(1, 2),
 		RunE:  newUnwatchItemRunE(opts, "issue"),
 	}
 	unwatchPRCmd := &cobra.Command{
-		Use:   "pr <alias> | OWNER/REPO NUMBER",
+		Use:   "pr <alias> | OWNER/REPO NUMBER | OWNER/REPO#NUMBER",
 		Short: "Stop watching a specific pull request",
 		Args:  cobra.RangeArgs(1, 2),
 		RunE:  newUnwatchItemRunE(opts, "pr"),
@@ -554,15 +647,15 @@ Scoping:
 
 Output:
 
-  --out results.md      writes markdown to a file
-  --out results.json    writes JSON (extension determines format)
+  --out .ferret/results.md      writes markdown to a file
+  --out .ferret/results.json    writes JSON (extension determines format)
   --format json         override format explicitly
 
 Examples:
 
   ferret manager my-repo
   ferret manager my-board --since 7d
-  ferret manager --all --out summary.md`,
+  ferret manager --all --out .ferret/summary.md`,
 		Args: cobra.MaximumNArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			ctx := cmd.Context()
@@ -610,7 +703,7 @@ Examples:
 					report.Partial = true
 					report.Warnings = append(report.Warnings, "viewer lookup failed; assigned-to-me filtering may be incomplete")
 				}
-				return renderToOutput(out, cmd.OutOrStdout(), func(w io.Writer) error {
+				return renderToOutput(out, cmd.OutOrStdout(), opts.allowOutsideWorkspace, func(w io.Writer) error {
 					return app.renderer.RenderManager(w, report)
 				})
 			}
@@ -627,14 +720,17 @@ Examples:
 				}
 				boardLookup := buildBoardStatusLookup(project, items)
 				for i := range items {
-					items[i] = normalizeProjectItem(items[i], viewer)
+					items[i] = normalizeProjectItem(items[i], viewer, project.StatusField)
 					if project.StatusField != "" {
 						items[i].BoardStatus = items[i].FieldValues[project.StatusField]
 					}
 				}
 				items = filterItems(items, filter)
 				report.Items = items
-				report.Summary = summarizeItems(items)
+				report.Summary, report.Warnings = summarizeProjectItems(items, project.StatusField)
+				if len(report.Warnings) > 0 {
+					report.Partial = true
+				}
 				for _, alias := range project.LinkedRepos {
 					repo, err := config.ResolveRepo(cfg, alias)
 					if err != nil {
@@ -654,7 +750,7 @@ Examples:
 					report.Partial = true
 					report.Warnings = append(report.Warnings, "viewer lookup failed; assigned-to-me filtering may be incomplete")
 				}
-				return renderToOutput(out, cmd.OutOrStdout(), func(w io.Writer) error {
+				return renderToOutput(out, cmd.OutOrStdout(), opts.allowOutsideWorkspace, func(w io.Writer) error {
 					return app.renderer.RenderManager(w, report)
 				})
 			}
@@ -667,14 +763,14 @@ Examples:
 				report.Partial = true
 				report.Warnings = append(report.Warnings, "viewer lookup failed; assigned-to-me filtering may be incomplete")
 			}
-			return renderToOutput(out, cmd.OutOrStdout(), func(w io.Writer) error {
+			return renderToOutput(out, cmd.OutOrStdout(), opts.allowOutsideWorkspace, func(w io.Writer) error {
 				return app.renderer.RenderManager(w, report)
 			})
 		},
 	}
-	cmd.Flags().StringVar(&since, "since", "", "lookback duration or timestamp (e.g. 24h, 7d, 2w, 2026-01-15); no cursor — always required to limit scope")
+	cmd.Flags().StringVar(&since, "since", "", "optional lookback duration or timestamp (e.g. 24h, 7d, 2w, 2026-01-15); no cursor is used")
 	cmd.Flags().StringVar(&filter, "filter", "", "filter preset")
-	cmd.Flags().StringVar(&out, "out", "", "write output to file (default format: markdown)")
+	cmd.Flags().StringVar(&out, "out", "", "write output to file under .ferret/ by default (default format: markdown)")
 	cmd.Flags().BoolVar(&all, "all", false, "run across all watched repos")
 	return cmd
 }
@@ -684,6 +780,7 @@ func newNextCmd(opts *rootOptions) *cobra.Command {
 	var filter string
 	var out string
 	var all bool
+	var me bool
 	cmd := &cobra.Command{
 		Use:   "next [alias]",
 		Short: "Show open work grouped for action",
@@ -692,6 +789,9 @@ func newNextCmd(opts *rootOptions) *cobra.Command {
 When an alias is provided the command scopes output to that single repo or
 project — no --all flag is required. Omitting an alias (or passing --all)
 runs across every watched repo.
+
+This is an action view, not a board-ground-truth report. Use manager for a
+full project snapshot.
 
 Filter presets:
 
@@ -703,9 +803,10 @@ Filter presets:
 Examples:
 
   ferret next my-repo
+  ferret next my-board --me
   ferret next my-board --filter assigned-to-me
   ferret next --all --filter actionable
-  ferret next my-repo --out next.md`,
+  ferret next my-repo --out .ferret/plans/next.md`,
 		Args: cobra.MaximumNArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			ctx := cmd.Context()
@@ -731,7 +832,11 @@ Examples:
 			if ref == "" {
 				all = true
 			}
-			effectiveSince, err := resolveSince(firstNonEmpty(since, defaultSinceForAlias(cfg, ref)))
+			filter, err = resolveNextFilter(filter, me)
+			if err != nil {
+				return err
+			}
+			effectiveSince, err := resolveSince(firstNonEmpty(since, defaultSinceForAlias(cfg, ref), "30d"))
 			if err != nil {
 				return err
 			}
@@ -743,7 +848,7 @@ Examples:
 				if viewerErr != nil {
 					report.Warnings = append(report.Warnings, "viewer lookup failed; assigned-to-me grouping may be incomplete")
 				}
-				if err := syncNextFile(out, report); err != nil {
+				if err := syncNextFile(out, report, opts); err != nil {
 					return err
 				}
 				return app.renderer.RenderNext(cmd.OutOrStdout(), report)
@@ -754,17 +859,19 @@ Examples:
 					return err
 				}
 				for i := range items {
-					items[i] = normalizeProjectItem(items[i], viewer)
+					items[i] = normalizeProjectItem(items[i], viewer, project.StatusField)
 				}
 				report := buildProjectNextReport(project.Alias, items, effectiveSince, firstNonEmpty(filter, "actionable"))
 				report.TargetKind = "project"
+				_, projectWarnings := summarizeProjectItems(items, project.StatusField)
+				report.Warnings = append(report.Warnings, projectWarnings...)
 				if viewerErr != nil {
 					report.Warnings = append(report.Warnings, "viewer lookup failed; assigned-to-me grouping may be incomplete")
 				}
 				if out == "" {
 					out = project.Output.PlanFile
 				}
-				if err := syncNextFile(out, report); err != nil {
+				if err := syncNextFile(out, report, opts); err != nil {
 					return err
 				}
 				return app.renderer.RenderNext(cmd.OutOrStdout(), report)
@@ -780,16 +887,17 @@ Examples:
 			if out == "" {
 				out = filepath.Join(cfg.Defaults.PlanDir, repo.Alias+".md")
 			}
-			if err := syncNextFile(out, report); err != nil {
+			if err := syncNextFile(out, report, opts); err != nil {
 				return err
 			}
 			return app.renderer.RenderNext(cmd.OutOrStdout(), report)
 		},
 	}
-	cmd.Flags().StringVar(&since, "since", "", "lookback duration or timestamp (e.g. 24h, 7d, 2w, 2026-01-15); no cursor — always required to limit scope")
+	cmd.Flags().StringVar(&since, "since", "", "lookback duration or timestamp (e.g. 24h, 7d, 2w, 2026-01-15); defaults to 30d when no per-alias default is set")
 	cmd.Flags().StringVar(&filter, "filter", "", "filter preset: open, assigned-to-me, actionable, recently-closed")
-	cmd.Flags().StringVar(&out, "out", "", "markdown output path")
+	cmd.Flags().StringVar(&out, "out", "", "markdown output path under .ferret/plans/ by default")
 	cmd.Flags().BoolVar(&all, "all", false, "run across all watched repos")
+	cmd.Flags().BoolVar(&me, "me", false, "alias for --filter assigned-to-me")
 	return cmd
 }
 
@@ -816,7 +924,7 @@ Pass --since to override the cursor for a one-off look.
 Scoping:
 
   catch-up               runs across all watched repos
-  catch-up <alias>       scopes to one repo or project alias
+  catch-up <alias>       scopes to one repo, project, or watched item alias
   catch-up --all         explicit all-repos mode
 
 Filtering:
@@ -827,19 +935,22 @@ Filtering:
 
 Output:
 
-  --out results.md      writes markdown to a file
-  --out results.json    writes JSON (extension determines format)
+  --out .ferret/results.md      writes markdown to a file
+  --out .ferret/results.json    writes JSON (extension determines format)
   --format json         override format explicitly
 
-Note: review fetches scale with the number of open PRs. When more than 20
-PRs are in scope, rate-limit warnings may appear in the output. GitHub's
-API rate limit is the real backstop — there is no internal cap.
+Note: deep review expansion and preview recovery use internal safety budgets.
+When those budgets are hit, Ferret emits explicit warnings and returns the
+best partial result it has. The budget only affects deep review-thread
+expansion, not the base issue and pull-request facts in scope. Under
+truncation, Ferret expands PRs using already-fetched GitHub signals such as
+review requests, notifications, direct involvement, and recency.
 
 Examples:
 
   ferret catch-up my-repo --me
   ferret catch-up --since 7d
-  ferret catch-up --all --me --out catchup.md`,
+  ferret catch-up --all --me --out .ferret/catchup.md`,
 		Args: cobra.MaximumNArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			ctx := cmd.Context()
@@ -901,23 +1012,53 @@ Examples:
 						projectBoardLookup = buildBoardStatusLookup(project, projectItems)
 					}
 				}
-				for _, alias := range project.LinkedRepos {
-					repo, err := config.ResolveRepo(cfg, alias)
-					if err != nil {
+				linkedRepos, resolveWarnings := resolveLinkedRepos(cfg, project.LinkedRepos)
+				if len(resolveWarnings) > 0 {
+					report.Partial = true
+					report.Warnings = append(report.Warnings, resolveWarnings...)
+				}
+				type repoResult struct {
+					entries  []domain.CatchUpEntry
+					warnings []string
+				}
+				results := make([]repoResult, len(linkedRepos))
+				var wg sync.WaitGroup
+				sem := make(chan struct{}, maxReposInFlight)
+				for i, repo := range linkedRepos {
+					i, repo := i, repo
+					wg.Add(1)
+					go func() {
+						defer wg.Done()
+						sem <- struct{}{}
+						defer func() { <-sem }()
+						progressf(cmd.ErrOrStderr(), "fetching repo %s/%s", repo.Owner, repo.Name)
+						entries, warnings := collectCatchUpForRepo(ctx, app, repo.Owner, repo.Name, effectiveSince, viewer, me, closedOnly, openOnly, commentsOnly, reviewOnly, cmd.ErrOrStderr())
+						results[i] = repoResult{entries: entries, warnings: warnings}
+					}()
+				}
+				wg.Wait()
+				for _, result := range results {
+					report.Entries = append(report.Entries, result.entries...)
+					if len(result.warnings) > 0 {
 						report.Partial = true
-						report.Warnings = append(report.Warnings, err.Error())
-						continue
-					}
-					progressf(cmd.ErrOrStderr(), "fetching repo %s/%s", repo.Owner, repo.Name)
-					entries, warnings := collectCatchUpForRepo(ctx, app, repo.Owner, repo.Name, effectiveSince, viewer, me, closedOnly, openOnly, commentsOnly, reviewOnly, cmd.ErrOrStderr())
-					report.Entries = append(report.Entries, entries...)
-					if len(warnings) > 0 {
-						report.Partial = true
-						report.Warnings = append(report.Warnings, warnings...)
+						report.Warnings = append(report.Warnings, result.warnings...)
 					}
 				}
 				if len(projectBoardLookup) > 0 {
 					applyBoardStatusToCatchUp(report.Entries, projectBoardLookup)
+				}
+			} else if item, err := config.ResolveItem(cfg, ref); err == nil {
+				report = domain.CatchUpReport{
+					GeneratedAt: time.Now().UTC(),
+					Target:      item.Alias,
+					TargetKind:  "item",
+					Since:       effectiveSince,
+				}
+				entry, warnings := collectWatchedItemEntry(ctx, app, *item, effectiveSince, cmd.ErrOrStderr())
+				report.WatchedItems = []domain.WatchedItemEntry{entry}
+				if len(warnings) > 0 {
+					report.Partial = true
+					report.Warnings = warnings
 				}
 			} else {
 				repo, err := config.ResolveRepo(cfg, ref)
@@ -942,9 +1083,10 @@ Examples:
 				report.Warnings = append(report.Warnings, "viewer lookup failed; --me filtering may be incomplete")
 			}
 			// Collect watched items separately — always included regardless of scope.
-			if len(cfg.Watch.Items) > 0 {
+			if report.TargetKind != "item" && len(cfg.Watch.Items) > 0 {
 				progressf(cmd.ErrOrStderr(), "fetching watched items")
 				watchedEntries, watchedWarnings := collectWatchedItems(ctx, app, cfg, effectiveSince, cmd.ErrOrStderr())
+				watchedEntries = filterWatchedItemsAgainstCatchUpEntries(watchedEntries, report.Entries)
 				report.WatchedItems = watchedEntries
 				if len(watchedWarnings) > 0 {
 					report.Partial = true
@@ -952,7 +1094,7 @@ Examples:
 				}
 			}
 			sortCatchUpEntries(report.Entries)
-			if err := renderToOutput(out, cmd.OutOrStdout(), func(w io.Writer) error {
+			if err := renderToOutput(out, cmd.OutOrStdout(), opts.allowOutsideWorkspace, func(w io.Writer) error {
 				return app.renderer.RenderCatchUp(w, report)
 			}); err != nil {
 				return err
@@ -969,7 +1111,7 @@ Examples:
 	cmd.Flags().BoolVar(&openOnly, "open-only", false, "show only open (non-terminal) items")
 	cmd.Flags().BoolVar(&commentsOnly, "comments-only", false, "show only comment and review activity")
 	cmd.Flags().BoolVar(&reviewOnly, "review-only", false, "show only items where a review was requested")
-	cmd.Flags().StringVar(&out, "out", "", "write output to file (default format: markdown)")
+	cmd.Flags().StringVar(&out, "out", "", "write output to file under .ferret/ by default (default format: markdown)")
 	cmd.Flags().BoolVar(&all, "all", false, "run across all watched repos")
 	return cmd
 }
@@ -1033,13 +1175,13 @@ everything. Use catch-up --me to focus on items relevant to you.
 Scoping:
 
   activity               runs across all watched repos
-  activity <alias>       scopes to one repo or project alias
+  activity <alias>       scopes to one repo, project, or watched item alias
   activity --all         explicit all-repos mode
 
 Output:
 
-  --out results.md      writes markdown to a file
-  --out results.json    writes JSON (extension determines format)
+  --out .ferret/results.md      writes markdown to a file
+  --out .ferret/results.json    writes JSON (extension determines format)
   --format json         override format explicitly
 
 The cursor advances after each successful run (same behaviour as catch-up).
@@ -1049,7 +1191,7 @@ Examples:
 
   ferret activity my-repo
   ferret activity --since 3d
-  ferret activity my-repo --out activity.md`,
+  ferret activity my-repo --out .ferret/activity.md`,
 		Args: cobra.MaximumNArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			ctx := cmd.Context()
@@ -1111,23 +1253,53 @@ Examples:
 						projectBoardLookupAct = buildBoardStatusLookup(project, projectItems)
 					}
 				}
-				for _, alias := range project.LinkedRepos {
-					repo, err := config.ResolveRepo(cfg, alias)
-					if err != nil {
+				linkedRepos, resolveWarnings := resolveLinkedRepos(cfg, project.LinkedRepos)
+				if len(resolveWarnings) > 0 {
+					report.Partial = true
+					report.Warnings = append(report.Warnings, resolveWarnings...)
+				}
+				type repoResult struct {
+					entries  []domain.ActivityEntry
+					warnings []string
+				}
+				results := make([]repoResult, len(linkedRepos))
+				var wg sync.WaitGroup
+				sem := make(chan struct{}, maxReposInFlight)
+				for i, repo := range linkedRepos {
+					i, repo := i, repo
+					wg.Add(1)
+					go func() {
+						defer wg.Done()
+						sem <- struct{}{}
+						defer func() { <-sem }()
+						progressf(cmd.ErrOrStderr(), "fetching repo %s/%s", repo.Owner, repo.Name)
+						entries, warnings := collectActivityForRepo(ctx, app, repo.Owner, repo.Name, effectiveSince, cmd.ErrOrStderr())
+						results[i] = repoResult{entries: entries, warnings: warnings}
+					}()
+				}
+				wg.Wait()
+				for _, result := range results {
+					report.Entries = append(report.Entries, result.entries...)
+					if len(result.warnings) > 0 {
 						report.Partial = true
-						report.Warnings = append(report.Warnings, err.Error())
-						continue
-					}
-					progressf(cmd.ErrOrStderr(), "fetching repo %s/%s", repo.Owner, repo.Name)
-					entries, warnings := collectActivityForRepo(ctx, app, repo.Owner, repo.Name, effectiveSince, cmd.ErrOrStderr())
-					report.Entries = append(report.Entries, entries...)
-					if len(warnings) > 0 {
-						report.Partial = true
-						report.Warnings = append(report.Warnings, warnings...)
+						report.Warnings = append(report.Warnings, result.warnings...)
 					}
 				}
 				if len(projectBoardLookupAct) > 0 {
 					applyBoardStatusToActivity(report.Entries, projectBoardLookupAct)
+				}
+			} else if item, err := config.ResolveItem(cfg, ref); err == nil {
+				report = domain.ActivityReport{
+					GeneratedAt: time.Now().UTC(),
+					Target:      item.Alias,
+					TargetKind:  "item",
+					Since:       effectiveSince,
+				}
+				entry, warnings := collectWatchedItemEntry(ctx, app, *item, effectiveSince, cmd.ErrOrStderr())
+				report.WatchedItems = []domain.WatchedItemEntry{entry}
+				if len(warnings) > 0 {
+					report.Partial = true
+					report.Warnings = warnings
 				}
 			} else {
 				repo, err := config.ResolveRepo(cfg, ref)
@@ -1148,9 +1320,10 @@ Examples:
 				}
 			}
 			// Collect watched items separately — always included regardless of scope.
-			if len(cfg.Watch.Items) > 0 {
+			if report.TargetKind != "item" && len(cfg.Watch.Items) > 0 {
 				progressf(cmd.ErrOrStderr(), "fetching watched items")
 				watchedEntries, watchedWarnings := collectWatchedItems(ctx, app, cfg, effectiveSince, cmd.ErrOrStderr())
+				watchedEntries = filterWatchedItemsAgainstActivityEntries(watchedEntries, report.Entries)
 				report.WatchedItems = watchedEntries
 				if len(watchedWarnings) > 0 {
 					report.Partial = true
@@ -1158,7 +1331,7 @@ Examples:
 				}
 			}
 			sortActivityEntries(report.Entries)
-			if err := renderToOutput(out, cmd.OutOrStdout(), func(w io.Writer) error {
+			if err := renderToOutput(out, cmd.OutOrStdout(), opts.allowOutsideWorkspace, func(w io.Writer) error {
 				return app.renderer.RenderActivity(w, report)
 			}); err != nil {
 				return err
@@ -1170,7 +1343,7 @@ Examples:
 		},
 	}
 	cmd.Flags().StringVar(&since, "since", "", "lookback duration or timestamp (e.g. 24h, 7d, 2w, 2026-01-15); overrides the per-alias cursor for a one-off look without advancing it")
-	cmd.Flags().StringVar(&out, "out", "", "write output to file (default format: markdown)")
+	cmd.Flags().StringVar(&out, "out", "", "write output to file under .ferret/ by default (default format: markdown)")
 	cmd.Flags().BoolVar(&all, "all", false, "run across all watched repos")
 	return cmd
 }
@@ -1180,16 +1353,80 @@ func newApp(opts *rootOptions, cmd *cobra.Command) (app, error) {
 	if err != nil {
 		return app{}, err
 	}
+	configPath, err := secureConfigPath(opts)
+	if err != nil {
+		return app{}, err
+	}
 	res, err := auth.Resolve(cmd.Context(), cmd.ErrOrStderr(), cmd.InOrStdin())
 	if err != nil {
 		return app{}, fmt.Errorf("authentication: %w", err)
 	}
 	return app{
-		store:    config.FileStore{Path: opts.configPath},
-		state:    config.FileStateStore{Path: config.StatePathForConfig(opts.configPath)},
+		store:    config.FileStore{Path: configPath},
+		state:    config.FileStateStore{Path: config.StatePathForConfig(configPath)},
 		backend:  github.NewHTTPBackend(res.Token),
 		renderer: r,
 	}, nil
+}
+
+func secureConfigPath(opts *rootOptions) (string, error) {
+	path := config.ExpandPath(opts.configPath)
+	if opts.allowOutsideWorkspace {
+		return path, nil
+	}
+	root, err := approvedRoot(config.DefaultOutputDir)
+	if err != nil {
+		return "", err
+	}
+	return fsutil.ResolveApprovedWritePath(path, root)
+}
+
+func approvedRoot(rel string) (string, error) {
+	cwd, err := os.Getwd()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(cwd, rel), nil
+}
+
+func secureOutputPath(path, root string, allowOutside bool) (string, error) {
+	path = config.ExpandPath(path)
+	if path == "" {
+		return "", nil
+	}
+	if allowOutside {
+		return path, nil
+	}
+	return fsutil.ResolveApprovedWritePath(path, root)
+}
+
+func validateTrustedConfigPaths(cfg *config.Config, allowOutside bool) error {
+	if allowOutside {
+		return nil
+	}
+	outputRoot, err := approvedRoot(config.DefaultOutputDir)
+	if err != nil {
+		return err
+	}
+	planRoot, err := approvedRoot(config.DefaultPlanDir)
+	if err != nil {
+		return err
+	}
+	if _, err := fsutil.ResolveApprovedWritePath(config.ExpandPath(cfg.Defaults.OutputDir), outputRoot); err != nil {
+		return fmt.Errorf("unsafe config: defaults.output_dir must stay under %s: %w", outputRoot, err)
+	}
+	if _, err := fsutil.ResolveApprovedWritePath(config.ExpandPath(cfg.Defaults.PlanDir), planRoot); err != nil {
+		return fmt.Errorf("unsafe config: defaults.plan_dir must stay under %s: %w", planRoot, err)
+	}
+	for _, project := range cfg.Watch.Projects {
+		if project.Output.PlanFile == "" {
+			continue
+		}
+		if _, err := fsutil.ResolveApprovedWritePath(config.ExpandPath(project.Output.PlanFile), planRoot); err != nil {
+			return fmt.Errorf("unsafe config: project %q output.plan_file must stay under %s: %w", project.Alias, planRoot, err)
+		}
+	}
+	return nil
 }
 
 func resolveProjectRef(cfg *config.Config, arg string) (owner string, number int, alias string, err error) {
@@ -1215,6 +1452,20 @@ func resolveRepoRef(cfg *config.Config, arg string) (owner string, repo string, 
 	return w.Owner, w.Name, nil
 }
 
+func resolveItemRef(cfg *config.Config, arg, kind string) (owner string, repo string, number int, err error) {
+	if strings.Contains(arg, "#") && strings.Count(arg, "/") == 1 {
+		return splitItemRef(arg)
+	}
+	item, err := config.ResolveItem(cfg, arg)
+	if err != nil {
+		return "", "", 0, err
+	}
+	if !strings.EqualFold(item.Kind, kind) {
+		return "", "", 0, fmt.Errorf("item alias %q is a %s, not a %s", arg, item.Kind, kind)
+	}
+	return item.Owner, item.Repo, item.Number, nil
+}
+
 func splitProjectRef(ref string) (string, int, error) {
 	parts := strings.Split(ref, "/")
 	if len(parts) != 2 {
@@ -1233,6 +1484,22 @@ func splitRepoRef(ref string) (string, string, error) {
 		return "", "", fmt.Errorf("repo ref must be owner/repo")
 	}
 	return parts[0], parts[1], nil
+}
+
+func splitItemRef(ref string) (string, string, int, error) {
+	parts := strings.Split(ref, "#")
+	if len(parts) != 2 {
+		return "", "", 0, fmt.Errorf("item ref must be owner/repo#number")
+	}
+	owner, repo, err := splitRepoRef(parts[0])
+	if err != nil {
+		return "", "", 0, err
+	}
+	number, err := strconv.Atoi(parts[1])
+	if err != nil || number <= 0 {
+		return "", "", 0, fmt.Errorf("NUMBER must be a positive integer, got %q", parts[1])
+	}
+	return owner, repo, number, nil
 }
 
 func renderWatchList(w io.Writer, cfg *config.Config) error {
@@ -1282,10 +1549,43 @@ func summarizeItems(items []domain.ProjectItem) map[string]int {
 	return out
 }
 
-func normalizeProjectItem(item domain.ProjectItem, viewer string) domain.ProjectItem {
+func summarizeProjectItems(items []domain.ProjectItem, statusField string) (map[string]int, []string) {
+	if statusField == "" {
+		return summarizeItems(items), nil
+	}
+	out := map[string]int{"total": len(items)}
+	missingStatus := 0
+	unknownValues := map[string]bool{}
+	for _, item := range items {
+		out[projectSummaryKey(item.Status)]++
+		if item.BoardStatus == "" {
+			if !strings.EqualFold(item.State, "closed") && !strings.EqualFold(item.State, "merged") {
+				missingStatus++
+			}
+			continue
+		}
+		if item.Status == domain.StatusUnknown && !strings.EqualFold(item.State, "closed") && !strings.EqualFold(item.State, "merged") {
+			unknownValues[item.BoardStatus] = true
+		}
+	}
+	var warnings []string
+	if missingStatus > 0 {
+		warnings = append(warnings, fmt.Sprintf("project status field %q missing on %d items; counted as board_unknown", statusField, missingStatus))
+	}
+	if len(unknownValues) > 0 {
+		values := mapKeys(unknownValues)
+		warnings = append(warnings, fmt.Sprintf("project status field %q has %d unmapped values (%s); counted as board_unknown", statusField, len(values), strings.Join(values, ", ")))
+	}
+	return out, warnings
+}
+
+func normalizeProjectItem(item domain.ProjectItem, viewer, statusField string) domain.ProjectItem {
 	out := item
 	out.AssignedToMe = slices.Contains(item.Assignees, viewer)
-	out.Status = genericStatus(item)
+	if statusField != "" {
+		out.BoardStatus = item.FieldValues[statusField]
+	}
+	out.Status = projectStatus(item, statusField)
 	out.Priority = genericPriority(item)
 	out.Blocked = out.Status == domain.StatusBlocked
 	return out
@@ -1352,27 +1652,68 @@ func applyBoardStatusToActivity(entries []domain.ActivityEntry, lookup map[strin
 
 func genericStatus(item domain.ProjectItem) domain.StatusTier {
 	for _, value := range item.FieldValues {
-		l := strings.ToLower(value)
-		switch {
-		case strings.Contains(l, "done") || strings.Contains(l, "closed"):
-			return domain.StatusDone
-		case strings.Contains(l, "review"):
-			return domain.StatusInReview
-		case strings.Contains(l, "progress"):
-			return domain.StatusInProgress
-		case strings.Contains(l, "ready") || strings.Contains(l, "todo"):
-			return domain.StatusReady
-		case strings.Contains(l, "block"):
-			return domain.StatusBlocked
-		case strings.Contains(l, "backlog"):
-			return domain.StatusBacklog
+		if status := statusTierForText(value); status != domain.StatusUnknown {
+			return status
 		}
 	}
+	return fallbackProjectStatus(item)
+}
+
+func projectStatus(item domain.ProjectItem, statusField string) domain.StatusTier {
+	if statusField == "" {
+		return genericStatus(item)
+	}
+	if value := item.FieldValues[statusField]; value != "" {
+		return statusTierForText(value)
+	}
+	return fallbackProjectStatus(item)
+}
+
+func fallbackProjectStatus(item domain.ProjectItem) domain.StatusTier {
 	switch strings.ToUpper(item.State) {
 	case "CLOSED", "MERGED":
 		return domain.StatusDone
 	default:
 		return domain.StatusUnknown
+	}
+}
+
+func statusTierForText(value string) domain.StatusTier {
+	l := strings.ToLower(value)
+	switch {
+	case strings.Contains(l, "done") || strings.Contains(l, "closed"):
+		return domain.StatusDone
+	case strings.Contains(l, "review"):
+		return domain.StatusInReview
+	case strings.Contains(l, "progress"):
+		return domain.StatusInProgress
+	case strings.Contains(l, "ready") || strings.Contains(l, "todo"):
+		return domain.StatusReady
+	case strings.Contains(l, "block"):
+		return domain.StatusBlocked
+	case strings.Contains(l, "backlog"):
+		return domain.StatusBacklog
+	default:
+		return domain.StatusUnknown
+	}
+}
+
+func projectSummaryKey(status domain.StatusTier) string {
+	switch status {
+	case domain.StatusReady:
+		return "board_ready"
+	case domain.StatusInProgress:
+		return "board_in_progress"
+	case domain.StatusInReview:
+		return "board_in_review"
+	case domain.StatusBlocked:
+		return "board_blocked"
+	case domain.StatusDone:
+		return "board_done"
+	case domain.StatusBacklog:
+		return "board_backlog"
+	default:
+		return "board_unknown"
 	}
 }
 
@@ -1497,6 +1838,15 @@ func cmpPriority(a, b domain.PriorityTier) int {
 		domain.PriorityNone,
 	}
 	return slices.Index(order, a) - slices.Index(order, b)
+}
+
+func mapKeys(values map[string]bool) []string {
+	out := make([]string, 0, len(values))
+	for value := range values {
+		out = append(out, value)
+	}
+	slices.Sort(out)
+	return out
 }
 
 func yesNo(v bool) string {
@@ -1692,38 +2042,96 @@ func defaultSinceForAlias(cfg *config.Config, alias string) string {
 }
 
 func appendRepoData(ctx context.Context, app app, owner, repo, since string, report *domain.ManagerReport, progress io.Writer) {
-	progressf(progress, "  issues %s/%s", owner, repo)
-	issues, err := app.backend.ListRepoIssues(ctx, owner, repo, github.IssueQuery{State: "all", Since: since})
-	if err != nil {
-		report.Partial = true
-		report.Warnings = append(report.Warnings, fmt.Sprintf("issues for %s/%s: %v", owner, repo, err))
-	} else {
-		report.Issues = append(report.Issues, issues...)
+	data := fetchManagerRepoData(ctx, app, owner, repo, since, progress)
+	report.Partial = report.Partial || data.partial
+	report.Warnings = append(report.Warnings, data.warnings...)
+	report.Issues = append(report.Issues, data.issues...)
+	report.PRs = append(report.PRs, data.prs...)
+	report.ReviewNeeded = append(report.ReviewNeeded, filterReviewNeededPRs(data.prs, data.viewer)...)
+	report.Workflows = append(report.Workflows, data.workflows...)
+}
+
+type managerRepoData struct {
+	issues    []domain.IssueSnapshot
+	prs       []domain.PRSnapshot
+	workflows []domain.WorkflowSnapshot
+	warnings  []string
+	partial   bool
+	viewer    string
+}
+
+func fetchManagerRepoData(ctx context.Context, app app, owner, repo, since string, progress io.Writer) managerRepoData {
+	var data managerRepoData
+	viewer, err := app.backend.GetViewer(ctx)
+	if err == nil {
+		data.viewer = viewer
 	}
-	progressf(progress, "  prs %s/%s", owner, repo)
-	prs, err := app.backend.ListRepoPRs(ctx, owner, repo, github.PRQuery{State: "all", Since: since})
-	if err != nil {
-		report.Partial = true
-		report.Warnings = append(report.Warnings, fmt.Sprintf("prs for %s/%s: %v", owner, repo, err))
-	} else {
-		report.PRs = append(report.PRs, prs...)
+	var wg sync.WaitGroup
+	var mu sync.Mutex
+	sem := make(chan struct{}, maxTopLevelFetchesPerRepo)
+	run := func(fn func()) {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			sem <- struct{}{}
+			defer func() { <-sem }()
+			fn()
+		}()
 	}
-	progressf(progress, "  review-needed prs %s/%s", owner, repo)
-	reviewNeeded, err := app.backend.ListRepoPRs(ctx, owner, repo, github.PRQuery{State: "open", Since: since, Review: true})
-	if err != nil {
-		report.Partial = true
-		report.Warnings = append(report.Warnings, fmt.Sprintf("review-needed prs for %s/%s: %v", owner, repo, err))
-	} else {
-		report.ReviewNeeded = append(report.ReviewNeeded, reviewNeeded...)
+	run(func() {
+		progressf(progress, "  issues %s/%s", owner, repo)
+		issues, err := app.backend.ListRepoIssues(ctx, owner, repo, github.IssueQuery{State: "all", Since: since})
+		mu.Lock()
+		defer mu.Unlock()
+		if err != nil {
+			data.partial = true
+			data.warnings = append(data.warnings, fmt.Sprintf("issues for %s/%s: %v", owner, repo, err))
+			return
+		}
+		data.issues = issues
+	})
+	run(func() {
+		progressf(progress, "  prs %s/%s", owner, repo)
+		prs, err := app.backend.ListRepoPRs(ctx, owner, repo, github.PRQuery{State: "all", Since: since})
+		mu.Lock()
+		defer mu.Unlock()
+		if err != nil {
+			data.partial = true
+			data.warnings = append(data.warnings, fmt.Sprintf("prs for %s/%s: %v", owner, repo, err))
+			return
+		}
+		data.prs = prs
+	})
+	run(func() {
+		progressf(progress, "  workflows %s/%s", owner, repo)
+		runs, err := app.backend.ListWorkflowRuns(ctx, owner, repo, github.WorkflowQuery{PerPage: 10, Since: since})
+		mu.Lock()
+		defer mu.Unlock()
+		if err != nil {
+			data.partial = true
+			data.warnings = append(data.warnings, fmt.Sprintf("workflow runs for %s/%s: %v", owner, repo, err))
+			return
+		}
+		data.workflows = runs
+	})
+	wg.Wait()
+	return data
+}
+
+func filterReviewNeededPRs(prs []domain.PRSnapshot, viewer string) []domain.PRSnapshot {
+	if viewer == "" {
+		return nil
 	}
-	progressf(progress, "  workflows %s/%s", owner, repo)
-	runs, err := app.backend.ListWorkflowRuns(ctx, owner, repo, github.WorkflowQuery{PerPage: 10, Since: since})
-	if err != nil {
-		report.Partial = true
-		report.Warnings = append(report.Warnings, fmt.Sprintf("workflow runs for %s/%s: %v", owner, repo, err))
-	} else {
-		report.Workflows = append(report.Workflows, runs...)
+	var out []domain.PRSnapshot
+	for _, pr := range prs {
+		if !strings.EqualFold(pr.State, "open") {
+			continue
+		}
+		if containsFold(pr.RequestedReviewers, viewer) {
+			out = append(out, pr)
+		}
 	}
+	return out
 }
 
 func buildRepoManagerReport(ctx context.Context, app app, owner, repo, alias, since string, progress io.Writer) domain.ManagerReport {
@@ -1755,9 +2163,28 @@ func buildAllReposManagerReport(ctx context.Context, app app, cfg *config.Config
 		Since:       since,
 		Summary:     map[string]int{},
 	}
-	for _, repo := range repos {
-		progressf(progress, "fetching repo %s/%s", repo.Owner, repo.Name)
-		appendRepoData(ctx, app, repo.Owner, repo.Name, since, &report, progress)
+	results := make([]managerRepoData, len(repos))
+	var wg sync.WaitGroup
+	sem := make(chan struct{}, maxReposInFlight)
+	for i, repo := range repos {
+		i, repo := i, repo
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			sem <- struct{}{}
+			defer func() { <-sem }()
+			progressf(progress, "fetching repo %s/%s", repo.Owner, repo.Name)
+			results[i] = fetchManagerRepoData(ctx, app, repo.Owner, repo.Name, since, progress)
+		}()
+	}
+	wg.Wait()
+	for _, data := range results {
+		report.Partial = report.Partial || data.partial
+		report.Warnings = append(report.Warnings, data.warnings...)
+		report.Issues = append(report.Issues, data.issues...)
+		report.PRs = append(report.PRs, data.prs...)
+		report.ReviewNeeded = append(report.ReviewNeeded, filterReviewNeededPRs(data.prs, data.viewer)...)
+		report.Workflows = append(report.Workflows, data.workflows...)
 	}
 	report.Summary["issues"] = len(report.Issues)
 	report.Summary["prs"] = len(report.PRs)
@@ -1774,15 +2201,9 @@ func buildRepoNextReport(ctx context.Context, app app, owner, repo, alias, since
 		TargetKind:  "repo",
 		Since:       since,
 	}
-	issues, err := app.backend.ListRepoIssues(ctx, owner, repo, github.IssueQuery{State: "all", Since: since})
-	if err != nil {
-		report.Warnings = append(report.Warnings, fmt.Sprintf("issues for %s/%s: %v", owner, repo, err))
-	}
-	prs, err := app.backend.ListRepoPRs(ctx, owner, repo, github.PRQuery{State: "all", Since: since})
-	if err != nil {
-		report.Warnings = append(report.Warnings, fmt.Sprintf("prs for %s/%s: %v", owner, repo, err))
-	}
-	items := repoSnapshotsToItems(issues, prs, viewer)
+	data := fetchNextRepoData(ctx, app, owner, repo, since)
+	report.Warnings = append(report.Warnings, data.warnings...)
+	items := repoSnapshotsToItems(data.issues, data.prs, viewer)
 	items = filterItems(items, firstNonEmpty(filter, "open"))
 	report.Sections = buildNextSections(items)
 	return report
@@ -1800,21 +2221,72 @@ func buildAllReposNextReport(ctx context.Context, app app, cfg *config.Config, s
 		Since:       since,
 	}
 	var items []domain.ProjectItem
-	for _, repo := range repos {
-		progressf(progress, "fetching repo %s/%s", repo.Owner, repo.Name)
-		issues, ierr := app.backend.ListRepoIssues(ctx, repo.Owner, repo.Name, github.IssueQuery{State: "all", Since: since})
-		if ierr != nil {
-			report.Warnings = append(report.Warnings, fmt.Sprintf("issues for %s/%s: %v", repo.Owner, repo.Name, ierr))
-		}
-		prs, perr := app.backend.ListRepoPRs(ctx, repo.Owner, repo.Name, github.PRQuery{State: "all", Since: since})
-		if perr != nil {
-			report.Warnings = append(report.Warnings, fmt.Sprintf("prs for %s/%s: %v", repo.Owner, repo.Name, perr))
-		}
-		items = append(items, repoSnapshotsToItems(issues, prs, viewer)...)
+	results := make([]nextRepoData, len(repos))
+	var wg sync.WaitGroup
+	sem := make(chan struct{}, maxReposInFlight)
+	for i, repo := range repos {
+		i, repo := i, repo
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			sem <- struct{}{}
+			defer func() { <-sem }()
+			progressf(progress, "fetching repo %s/%s", repo.Owner, repo.Name)
+			results[i] = fetchNextRepoData(ctx, app, repo.Owner, repo.Name, since)
+		}()
+	}
+	wg.Wait()
+	for _, data := range results {
+		report.Warnings = append(report.Warnings, data.warnings...)
+		items = append(items, repoSnapshotsToItems(data.issues, data.prs, viewer)...)
 	}
 	items = filterItems(items, firstNonEmpty(filter, "open"))
 	report.Sections = buildNextSections(items)
 	return report, nil
+}
+
+type nextRepoData struct {
+	issues   []domain.IssueSnapshot
+	prs      []domain.PRSnapshot
+	warnings []string
+}
+
+func fetchNextRepoData(ctx context.Context, app app, owner, repo, since string) nextRepoData {
+	var data nextRepoData
+	var wg sync.WaitGroup
+	var mu sync.Mutex
+	sem := make(chan struct{}, maxTopLevelFetchesPerRepo)
+	run := func(fn func()) {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			sem <- struct{}{}
+			defer func() { <-sem }()
+			fn()
+		}()
+	}
+	run(func() {
+		issues, err := app.backend.ListRepoIssues(ctx, owner, repo, github.IssueQuery{State: "all", Since: since})
+		mu.Lock()
+		defer mu.Unlock()
+		if err != nil {
+			data.warnings = append(data.warnings, fmt.Sprintf("issues for %s/%s: %v", owner, repo, err))
+			return
+		}
+		data.issues = issues
+	})
+	run(func() {
+		prs, err := app.backend.ListRepoPRs(ctx, owner, repo, github.PRQuery{State: "all", Since: since})
+		mu.Lock()
+		defer mu.Unlock()
+		if err != nil {
+			data.warnings = append(data.warnings, fmt.Sprintf("prs for %s/%s: %v", owner, repo, err))
+			return
+		}
+		data.prs = prs
+	})
+	wg.Wait()
+	return data
 }
 
 func buildProjectNextReport(alias string, items []domain.ProjectItem, since, filter string) domain.NextReport {
@@ -1880,9 +2352,17 @@ func repoSnapshotsToItems(issues []domain.IssueSnapshot, prs []domain.PRSnapshot
 	return items
 }
 
-func syncNextFile(path string, report domain.NextReport) error {
+func syncNextFile(path string, report domain.NextReport, opts *rootOptions) error {
 	if path == "" {
 		return nil
+	}
+	root, err := approvedRoot(config.DefaultPlanDir)
+	if err != nil {
+		return err
+	}
+	path, err = secureOutputPath(path, root, opts.allowOutsideWorkspace)
+	if err != nil {
+		return err
 	}
 	var existing string
 	if data, err := os.ReadFile(path); err == nil {
@@ -1901,6 +2381,7 @@ func syncNextFile(path string, report domain.NextReport) error {
 // The extension is derived from format: "json" → .json, everything else → .md.
 // When path is empty or already has an extension, it is returned unchanged.
 func resolveOutputPath(path, format string) string {
+	path = config.ExpandPath(path)
 	if path == "" || filepath.Ext(path) != "" {
 		return path
 	}
@@ -1910,15 +2391,33 @@ func resolveOutputPath(path, format string) string {
 	return path + ".md"
 }
 
-func renderToOutput(path string, stdout io.Writer, fn func(io.Writer) error) error {
+func renderToOutput(path string, stdout io.Writer, allowOutside bool, fn func(io.Writer) error) error {
 	if path == "" {
 		return fn(stdout)
+	}
+	root, err := approvedRoot(config.DefaultOutputDir)
+	if err != nil {
+		return err
+	}
+	path, err = secureOutputPath(path, root, allowOutside)
+	if err != nil {
+		return err
 	}
 	var buf strings.Builder
 	if err := fn(&buf); err != nil {
 		return err
 	}
 	return fsutil.AtomicWriteFile(path, []byte(buf.String()))
+}
+
+func resolveNextFilter(filter string, me bool) (string, error) {
+	if !me {
+		return filter, nil
+	}
+	if filter != "" && filter != "assigned-to-me" {
+		return "", fmt.Errorf("use either --me or --filter %q", filter)
+	}
+	return "assigned-to-me", nil
 }
 
 func contains(values []string, want string) bool {
@@ -1930,61 +2429,182 @@ func contains(values []string, want string) bool {
 	return false
 }
 
-func collectCatchUpForRepo(ctx context.Context, app app, owner, repo, since, viewer string, me, closedOnly, openOnly, commentsOnly, reviewOnly bool, progress io.Writer) ([]domain.CatchUpEntry, []string) {
+func containsFold(values []string, want string) bool {
+	for _, value := range values {
+		if strings.EqualFold(value, want) {
+			return true
+		}
+	}
+	return false
+}
+
+type catchUpBudget struct {
+	MaxPRReviewFetches int
+	MaxRecoveryFetches int
+}
+
+func defaultCatchUpBudget() catchUpBudget {
+	return catchUpBudget{
+		MaxPRReviewFetches: 20,
+		MaxRecoveryFetches: 10,
+	}
+}
+
+func prioritizePRsForReviewFetch(prs []domain.PRSnapshot, notifications []domain.NotificationThread, viewer string) []domain.PRSnapshot {
+	if len(prs) == 0 {
+		return nil
+	}
+	notificationReasonsByPR := map[int][]string{}
+	for _, thread := range notifications {
+		if thread.Kind != "pull_request" {
+			continue
+		}
+		notificationReasonsByPR[thread.Number] = append(notificationReasonsByPR[thread.Number], thread.Reason)
+	}
+	prioritized := append([]domain.PRSnapshot(nil), prs...)
+	slices.SortStableFunc(prioritized, func(a, b domain.PRSnapshot) int {
+		scoreA := reviewFetchPriorityScore(a, notificationReasonsByPR[a.Number], viewer)
+		scoreB := reviewFetchPriorityScore(b, notificationReasonsByPR[b.Number], viewer)
+		if scoreA != scoreB {
+			return scoreB - scoreA
+		}
+		if !a.UpdatedAt.Equal(b.UpdatedAt) {
+			if a.UpdatedAt.After(b.UpdatedAt) {
+				return -1
+			}
+			return 1
+		}
+		return b.Number - a.Number
+	})
+	return prioritized
+}
+
+func reviewFetchPriorityScore(pr domain.PRSnapshot, notificationReasons []string, viewer string) int {
+	score := 0
+	switch strings.ToLower(pr.State) {
+	case "open":
+		score += 40
+	case "merged", "closed":
+		score += 5
+	default:
+		score += 10
+	}
+	if !pr.IsDraft {
+		score += 5
+	}
+	if viewer != "" {
+		if pr.Author == viewer {
+			score += 15
+		}
+		if contains(pr.Assignees, viewer) {
+			score += 20
+		}
+		if contains(pr.RequestedReviewers, viewer) {
+			score += 45
+		}
+	}
+	for _, reason := range notificationReasons {
+		switch reason {
+		case "review_requested":
+			score += 50
+		case "mention", "team_mention":
+			score += 25
+		case "comment", "author", "assign":
+			score += 20
+		default:
+			score += 10
+		}
+	}
+	return score
+}
+
+func boundedPRsForReviewFetch(prs []domain.PRSnapshot, max int) ([]domain.PRSnapshot, bool) {
+	if max <= 0 || len(prs) <= max {
+		return prs, false
+	}
+	return prs[:max], true
+}
+
+func exactMentionMatch(preview, viewer string) bool {
+	if preview == "" || viewer == "" {
+		return false
+	}
+	lowerPreview := strings.ToLower(preview)
+	needle := "@" + strings.ToLower(viewer)
+	idx := strings.Index(lowerPreview, needle)
+	if idx < 0 {
+		return false
+	}
+	beforeOK := idx == 0 || !isMentionRune(rune(lowerPreview[idx-1]))
+	afterIdx := idx + len(needle)
+	afterOK := afterIdx >= len(lowerPreview) || !isMentionRune(rune(lowerPreview[afterIdx]))
+	return beforeOK && afterOK
+}
+
+func isMentionRune(r rune) bool {
+	return (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') || r == '-' || r == '_'
+}
+
+func collectPRReviewActivityWithBudget(ctx context.Context, app app, owner, repo, since string, prs []domain.PRSnapshot, budget catchUpBudget) ([]domain.ActivityEvent, []string) {
+	limitedPRs, truncated := boundedPRsForReviewFetch(prs, budget.MaxPRReviewFetches)
 	var warnings []string
-	progressf(progress, "  issues %s/%s", owner, repo)
-	issues, err := app.backend.ListRepoIssues(ctx, owner, repo, github.IssueQuery{State: "all", Since: since})
-	if err != nil {
-		if github.IsKind(err, github.ErrRateLimited) {
-			warnings = append(warnings, fmt.Sprintf("rate-limited fetching issues for %s/%s (partial results)", owner, repo))
-		} else {
-			warnings = append(warnings, fmt.Sprintf("issues for %s/%s: %v", owner, repo, err))
-		}
+	if truncated {
+		warnings = append(warnings, fmt.Sprintf("review fetch budget hit for %s/%s: expanded %d of %d PRs", owner, repo, len(limitedPRs), len(prs)))
 	}
-	progressf(progress, "  prs %s/%s", owner, repo)
-	prs, err := app.backend.ListRepoPRs(ctx, owner, repo, github.PRQuery{State: "all", Since: since})
-	if err != nil {
-		if github.IsKind(err, github.ErrRateLimited) {
-			warnings = append(warnings, fmt.Sprintf("rate-limited fetching prs for %s/%s (partial results)", owner, repo))
-		} else {
-			warnings = append(warnings, fmt.Sprintf("prs for %s/%s: %v", owner, repo, err))
-		}
+	type reviewResult struct {
+		events  []domain.ActivityEvent
+		warning string
 	}
+	results := make([]reviewResult, len(limitedPRs))
+	var wg sync.WaitGroup
+	sem := make(chan struct{}, maxPRReviewThreadsInFlight)
+	for i, pr := range limitedPRs {
+		i, pr := i, pr
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			sem <- struct{}{}
+			defer func() { <-sem }()
+			reviews, err := app.backend.ListPullRequestThreadReviews(ctx, owner, repo, pr.Number)
+			if err != nil {
+				results[i].warning = fmt.Sprintf("reviews for %s/%s#%d: %v", owner, repo, pr.Number, err)
+				return
+			}
+			for _, review := range reviews {
+				if !withinSinceReport(since, &review.OccurredAt) {
+					continue
+				}
+				results[i].events = append(results[i].events, review)
+			}
+		}()
+	}
+	wg.Wait()
+	var events []domain.ActivityEvent
+	for _, result := range results {
+		if result.warning != "" {
+			warnings = append(warnings, result.warning)
+		}
+		events = append(events, result.events...)
+	}
+	return events, warnings
+}
+
+func collectCatchUpForRepo(ctx context.Context, app app, owner, repo, since, viewer string, me, closedOnly, openOnly, commentsOnly, reviewOnly bool, progress io.Writer) ([]domain.CatchUpEntry, []string) {
+	data := fetchCatchUpRepoData(ctx, app, owner, repo, since, progress)
+	warnings := append([]string(nil), data.warnings...)
+	budget := defaultCatchUpBudget()
+	issues := data.issues
+	prs := data.prs
 	if len(prs) > 20 {
 		progressf(progress, "  warning: %d PRs in scope for %s/%s — review fetches scale with PR count and may approach GitHub rate limits", len(prs), owner, repo)
 	}
-	progressf(progress, "  issue comments %s/%s", owner, repo)
-	issueComments, err := app.backend.ListIssueCommentActivity(ctx, owner, repo, since)
-	if err != nil {
-		if github.IsKind(err, github.ErrRateLimited) {
-			warnings = append(warnings, fmt.Sprintf("rate-limited fetching issue comments for %s/%s (partial results)", owner, repo))
-		} else {
-			warnings = append(warnings, fmt.Sprintf("issue comments for %s/%s: %v", owner, repo, err))
-		}
-	}
-	progressf(progress, "  review comments %s/%s", owner, repo)
-	reviewComments, err := app.backend.ListPullRequestReviewCommentActivity(ctx, owner, repo, since)
-	if err != nil {
-		if github.IsKind(err, github.ErrRateLimited) {
-			warnings = append(warnings, fmt.Sprintf("rate-limited fetching review comments for %s/%s (partial results)", owner, repo))
-		} else {
-			warnings = append(warnings, fmt.Sprintf("review comments for %s/%s: %v", owner, repo, err))
-		}
-	}
+	issueComments := data.issueComments
+	reviewComments := data.reviewComments
+	notifications := data.notifications
 	progressf(progress, "  reviews %s/%s", owner, repo)
-	reviews, err := app.backend.ListPullRequestReviewActivity(ctx, owner, repo, since)
-	if err != nil {
-		if github.IsKind(err, github.ErrRateLimited) {
-			warnings = append(warnings, fmt.Sprintf("rate-limited fetching reviews for %s/%s (partial results)", owner, repo))
-		} else {
-			warnings = append(warnings, fmt.Sprintf("reviews for %s/%s: %v", owner, repo, err))
-		}
-	}
-	progressf(progress, "  notifications %s/%s", owner, repo)
-	notifications, err := app.backend.ListRepoNotifications(ctx, owner, repo, since)
-	if err != nil {
-		warnings = append(warnings, fmt.Sprintf("notifications for %s/%s: %v", owner, repo, err))
-	}
+	reviewPRs := prioritizePRsForReviewFetch(prs, notifications, viewer)
+	reviews, reviewWarnings := collectPRReviewActivityWithBudget(ctx, app, owner, repo, since, reviewPRs, budget)
+	warnings = append(warnings, reviewWarnings...)
 	index := map[string]*domain.CatchUpEntry{}
 	addEvent := func(event domain.ActivityEvent, title, url, state string, involvement []string) {
 		key := fmt.Sprintf("%s#%d:%s", event.Repo, event.Number, event.Kind)
@@ -2068,19 +2688,7 @@ func collectCatchUpForRepo(ctx context.Context, app app, owner, repo, since, vie
 		}
 	}
 	for _, event := range append(append(issueComments, reviewComments...), reviews...) {
-		var title, url, state string
-		var involvement []string
-		if event.Kind == "issue" {
-			if issue, ok := findIssue(issues, event.Number); ok {
-				title, url, state = issue.Title, issue.URL, issue.State
-				involvement = mergeStrings(involvementForIssue(issue, viewer), involvementForActor(event.Actor, viewer, event.EventType))
-			}
-		} else {
-			if pr, ok := findPR(prs, event.Number); ok {
-				title, url, state = pr.Title, pr.URL, pr.State
-				involvement = mergeStrings(involvementForPR(pr, viewer), involvementForActor(event.Actor, viewer, event.EventType))
-			}
-		}
+		event, title, url, state, involvement := normalizeCatchUpEvent(event, issues, prs, viewer)
 		addEvent(event, title, url, state, involvement)
 	}
 	for _, thread := range notifications {
@@ -2107,7 +2715,7 @@ func collectCatchUpForRepo(ctx context.Context, app app, owner, repo, since, vie
 	addCatchUpFallbackUpdates(index, issues, prs, since, viewer)
 	if me && viewer != "" {
 		progressf(progress, "  recovery %s/%s", owner, repo)
-		recoverWarnings := recoverNotificationPreviews(ctx, app, owner, repo, since, viewer, index)
+		recoverWarnings := recoverNotificationPreviews(ctx, app, owner, repo, since, viewer, index, budget)
 		warnings = append(warnings, recoverWarnings...)
 	}
 	var entries []domain.CatchUpEntry
@@ -2118,6 +2726,104 @@ func collectCatchUpForRepo(ctx context.Context, app app, owner, repo, since, vie
 		entries = append(entries, *entry)
 	}
 	return entries, warnings
+}
+
+type catchUpRepoData struct {
+	issues         []domain.IssueSnapshot
+	prs            []domain.PRSnapshot
+	issueComments  []domain.ActivityEvent
+	reviewComments []domain.ActivityEvent
+	notifications  []domain.NotificationThread
+	warnings       []string
+}
+
+func fetchCatchUpRepoData(ctx context.Context, app app, owner, repo, since string, progress io.Writer) catchUpRepoData {
+	var data catchUpRepoData
+	var wg sync.WaitGroup
+	var mu sync.Mutex
+	sem := make(chan struct{}, maxTopLevelFetchesPerRepo)
+	run := func(fn func()) {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			sem <- struct{}{}
+			defer func() { <-sem }()
+			fn()
+		}()
+	}
+	run(func() {
+		progressf(progress, "  issues %s/%s", owner, repo)
+		issues, err := app.backend.ListRepoIssues(ctx, owner, repo, github.IssueQuery{State: "all", Since: since})
+		mu.Lock()
+		defer mu.Unlock()
+		if err != nil {
+			if github.IsKind(err, github.ErrRateLimited) {
+				data.warnings = append(data.warnings, fmt.Sprintf("rate-limited fetching issues for %s/%s (partial results)", owner, repo))
+			} else {
+				data.warnings = append(data.warnings, fmt.Sprintf("issues for %s/%s: %v", owner, repo, err))
+			}
+			return
+		}
+		data.issues = issues
+	})
+	run(func() {
+		progressf(progress, "  prs %s/%s", owner, repo)
+		prs, err := app.backend.ListRepoPRs(ctx, owner, repo, github.PRQuery{State: "all", Since: since})
+		mu.Lock()
+		defer mu.Unlock()
+		if err != nil {
+			if github.IsKind(err, github.ErrRateLimited) {
+				data.warnings = append(data.warnings, fmt.Sprintf("rate-limited fetching prs for %s/%s (partial results)", owner, repo))
+			} else {
+				data.warnings = append(data.warnings, fmt.Sprintf("prs for %s/%s: %v", owner, repo, err))
+			}
+			return
+		}
+		data.prs = prs
+	})
+	run(func() {
+		progressf(progress, "  issue comments %s/%s", owner, repo)
+		events, err := app.backend.ListIssueCommentActivity(ctx, owner, repo, since)
+		mu.Lock()
+		defer mu.Unlock()
+		if err != nil {
+			if github.IsKind(err, github.ErrRateLimited) {
+				data.warnings = append(data.warnings, fmt.Sprintf("rate-limited fetching issue comments for %s/%s (partial results)", owner, repo))
+			} else {
+				data.warnings = append(data.warnings, fmt.Sprintf("issue comments for %s/%s: %v", owner, repo, err))
+			}
+			return
+		}
+		data.issueComments = events
+	})
+	run(func() {
+		progressf(progress, "  review comments %s/%s", owner, repo)
+		events, err := app.backend.ListPullRequestReviewCommentActivity(ctx, owner, repo, since)
+		mu.Lock()
+		defer mu.Unlock()
+		if err != nil {
+			if github.IsKind(err, github.ErrRateLimited) {
+				data.warnings = append(data.warnings, fmt.Sprintf("rate-limited fetching review comments for %s/%s (partial results)", owner, repo))
+			} else {
+				data.warnings = append(data.warnings, fmt.Sprintf("review comments for %s/%s: %v", owner, repo, err))
+			}
+			return
+		}
+		data.reviewComments = events
+	})
+	run(func() {
+		progressf(progress, "  notifications %s/%s", owner, repo)
+		threads, err := app.backend.ListRepoNotifications(ctx, owner, repo, since)
+		mu.Lock()
+		defer mu.Unlock()
+		if err != nil {
+			data.warnings = append(data.warnings, fmt.Sprintf("notifications for %s/%s: %v", owner, repo, err))
+			return
+		}
+		data.notifications = threads
+	})
+	wg.Wait()
+	return data
 }
 
 func addCatchUpFallbackUpdates(index map[string]*domain.CatchUpEntry, issues []domain.IssueSnapshot, prs []domain.PRSnapshot, since, viewer string) {
@@ -2192,32 +2898,15 @@ func matchesCatchUpFilters(entry *domain.CatchUpEntry, me, closedOnly, openOnly,
 }
 
 func collectActivityForRepo(ctx context.Context, app app, owner, repo, since string, progress io.Writer) ([]domain.ActivityEntry, []string) {
-	var warnings []string
-	progressf(progress, "  issues %s/%s", owner, repo)
-	issues, err := app.backend.ListRepoIssues(ctx, owner, repo, github.IssueQuery{State: "all", Since: since})
-	if err != nil {
-		warnings = append(warnings, fmt.Sprintf("issues for %s/%s: %v", owner, repo, err))
-	}
-	progressf(progress, "  prs %s/%s", owner, repo)
-	prs, err := app.backend.ListRepoPRs(ctx, owner, repo, github.PRQuery{State: "all", Since: since})
-	if err != nil {
-		warnings = append(warnings, fmt.Sprintf("prs for %s/%s: %v", owner, repo, err))
-	}
-	progressf(progress, "  issue comments %s/%s", owner, repo)
-	issueComments, err := app.backend.ListIssueCommentActivity(ctx, owner, repo, since)
-	if err != nil {
-		warnings = append(warnings, fmt.Sprintf("issue comments for %s/%s: %v", owner, repo, err))
-	}
-	progressf(progress, "  review comments %s/%s", owner, repo)
-	reviewComments, err := app.backend.ListPullRequestReviewCommentActivity(ctx, owner, repo, since)
-	if err != nil {
-		warnings = append(warnings, fmt.Sprintf("review comments for %s/%s: %v", owner, repo, err))
-	}
+	data := fetchActivityRepoData(ctx, app, owner, repo, since, progress)
+	warnings := append([]string(nil), data.warnings...)
+	issues := data.issues
+	prs := data.prs
+	issueComments := data.issueComments
+	reviewComments := data.reviewComments
 	progressf(progress, "  reviews %s/%s", owner, repo)
-	reviews, err := app.backend.ListPullRequestReviewActivity(ctx, owner, repo, since)
-	if err != nil {
-		warnings = append(warnings, fmt.Sprintf("reviews for %s/%s: %v", owner, repo, err))
-	}
+	reviews, reviewWarnings := collectPRReviewActivityWithBudget(ctx, app, owner, repo, since, prs, catchUpBudget{})
+	warnings = append(warnings, reviewWarnings...)
 	var entries []domain.ActivityEntry
 	for _, issue := range issues {
 		if withinSinceReport(since, &issue.CreatedAt) {
@@ -2263,17 +2952,82 @@ func collectActivityForRepo(ctx context.Context, app app, owner, repo, since str
 		}
 	}
 	for _, event := range append(append(issueComments, reviewComments...), reviews...) {
-		if event.Kind == "issue" {
-			if issue, ok := findIssue(issues, event.Number); ok {
-				entries = append(entries, activityEntryFromEvent(event, issue.Title, issue.URL, issue.State))
-			}
-			continue
-		}
-		if pr, ok := findPR(prs, event.Number); ok {
-			entries = append(entries, activityEntryFromEvent(event, pr.Title, pr.URL, pr.State))
+		event, title, url, state, ok := normalizeActivityEvent(event, issues, prs)
+		if ok {
+			entries = append(entries, activityEntryFromEvent(event, title, url, state))
 		}
 	}
 	return entries, warnings
+}
+
+type activityRepoData struct {
+	issues         []domain.IssueSnapshot
+	prs            []domain.PRSnapshot
+	issueComments  []domain.ActivityEvent
+	reviewComments []domain.ActivityEvent
+	warnings       []string
+}
+
+func fetchActivityRepoData(ctx context.Context, app app, owner, repo, since string, progress io.Writer) activityRepoData {
+	var data activityRepoData
+	var wg sync.WaitGroup
+	var mu sync.Mutex
+	sem := make(chan struct{}, maxTopLevelFetchesPerRepo)
+	run := func(fn func()) {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			sem <- struct{}{}
+			defer func() { <-sem }()
+			fn()
+		}()
+	}
+	run(func() {
+		progressf(progress, "  issues %s/%s", owner, repo)
+		issues, err := app.backend.ListRepoIssues(ctx, owner, repo, github.IssueQuery{State: "all", Since: since})
+		mu.Lock()
+		defer mu.Unlock()
+		if err != nil {
+			data.warnings = append(data.warnings, fmt.Sprintf("issues for %s/%s: %v", owner, repo, err))
+			return
+		}
+		data.issues = issues
+	})
+	run(func() {
+		progressf(progress, "  prs %s/%s", owner, repo)
+		prs, err := app.backend.ListRepoPRs(ctx, owner, repo, github.PRQuery{State: "all", Since: since})
+		mu.Lock()
+		defer mu.Unlock()
+		if err != nil {
+			data.warnings = append(data.warnings, fmt.Sprintf("prs for %s/%s: %v", owner, repo, err))
+			return
+		}
+		data.prs = prs
+	})
+	run(func() {
+		progressf(progress, "  issue comments %s/%s", owner, repo)
+		events, err := app.backend.ListIssueCommentActivity(ctx, owner, repo, since)
+		mu.Lock()
+		defer mu.Unlock()
+		if err != nil {
+			data.warnings = append(data.warnings, fmt.Sprintf("issue comments for %s/%s: %v", owner, repo, err))
+			return
+		}
+		data.issueComments = events
+	})
+	run(func() {
+		progressf(progress, "  review comments %s/%s", owner, repo)
+		events, err := app.backend.ListPullRequestReviewCommentActivity(ctx, owner, repo, since)
+		mu.Lock()
+		defer mu.Unlock()
+		if err != nil {
+			data.warnings = append(data.warnings, fmt.Sprintf("review comments for %s/%s: %v", owner, repo, err))
+			return
+		}
+		data.reviewComments = events
+	})
+	wg.Wait()
+	return data
 }
 
 func buildAllReposCatchUpReport(ctx context.Context, app app, cfg *config.Config, since, viewer string, me, closedOnly, openOnly, commentsOnly, reviewOnly bool, progress io.Writer) (domain.CatchUpReport, error) {
@@ -2287,13 +3041,31 @@ func buildAllReposCatchUpReport(ctx context.Context, app app, cfg *config.Config
 		TargetKind:  "portfolio",
 		Since:       since,
 	}
-	for _, repo := range repos {
-		progressf(progress, "fetching repo %s/%s", repo.Owner, repo.Name)
-		entries, warnings := collectCatchUpForRepo(ctx, app, repo.Owner, repo.Name, since, viewer, me, closedOnly, openOnly, commentsOnly, reviewOnly, progress)
-		report.Entries = append(report.Entries, entries...)
-		if len(warnings) > 0 {
+	type repoResult struct {
+		entries  []domain.CatchUpEntry
+		warnings []string
+	}
+	results := make([]repoResult, len(repos))
+	var wg sync.WaitGroup
+	sem := make(chan struct{}, maxReposInFlight)
+	for i, repo := range repos {
+		i, repo := i, repo
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			sem <- struct{}{}
+			defer func() { <-sem }()
+			progressf(progress, "fetching repo %s/%s", repo.Owner, repo.Name)
+			entries, warnings := collectCatchUpForRepo(ctx, app, repo.Owner, repo.Name, since, viewer, me, closedOnly, openOnly, commentsOnly, reviewOnly, progress)
+			results[i] = repoResult{entries: entries, warnings: warnings}
+		}()
+	}
+	wg.Wait()
+	for _, result := range results {
+		report.Entries = append(report.Entries, result.entries...)
+		if len(result.warnings) > 0 {
 			report.Partial = true
-			report.Warnings = append(report.Warnings, warnings...)
+			report.Warnings = append(report.Warnings, result.warnings...)
 		}
 	}
 	return report, nil
@@ -2310,13 +3082,31 @@ func buildAllReposActivityReport(ctx context.Context, app app, cfg *config.Confi
 		TargetKind:  "portfolio",
 		Since:       since,
 	}
-	for _, repo := range repos {
-		progressf(progress, "fetching repo %s/%s", repo.Owner, repo.Name)
-		entries, warnings := collectActivityForRepo(ctx, app, repo.Owner, repo.Name, since, progress)
-		report.Entries = append(report.Entries, entries...)
-		if len(warnings) > 0 {
+	type repoResult struct {
+		entries  []domain.ActivityEntry
+		warnings []string
+	}
+	results := make([]repoResult, len(repos))
+	var wg sync.WaitGroup
+	sem := make(chan struct{}, maxReposInFlight)
+	for i, repo := range repos {
+		i, repo := i, repo
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			sem <- struct{}{}
+			defer func() { <-sem }()
+			progressf(progress, "fetching repo %s/%s", repo.Owner, repo.Name)
+			entries, warnings := collectActivityForRepo(ctx, app, repo.Owner, repo.Name, since, progress)
+			results[i] = repoResult{entries: entries, warnings: warnings}
+		}()
+	}
+	wg.Wait()
+	for _, result := range results {
+		report.Entries = append(report.Entries, result.entries...)
+		if len(result.warnings) > 0 {
 			report.Partial = true
-			report.Warnings = append(report.Warnings, warnings...)
+			report.Warnings = append(report.Warnings, result.warnings...)
 		}
 	}
 	return report, nil
@@ -2329,11 +3119,49 @@ func allWatchedRepos(cfg *config.Config) ([]config.RepoWatch, error) {
 	return append([]config.RepoWatch(nil), cfg.Watch.Repos...), nil
 }
 
+func resolveLinkedRepos(cfg *config.Config, aliases []string) ([]config.RepoWatch, []string) {
+	repos := make([]config.RepoWatch, 0, len(aliases))
+	var warnings []string
+	for _, alias := range aliases {
+		repo, err := config.ResolveRepo(cfg, alias)
+		if err != nil {
+			warnings = append(warnings, err.Error())
+			continue
+		}
+		repos = append(repos, *repo)
+	}
+	return repos, warnings
+}
+
 func activityEntryFromEvent(event domain.ActivityEvent, title, url, state string) domain.ActivityEntry {
 	return domain.ActivityEntry{
 		Repo: event.Repo, Owner: event.Owner, Number: event.Number, Kind: event.Kind, Title: title, URL: url,
 		State: state, EventType: event.EventType, Actor: event.Actor, OccurredAt: event.OccurredAt, Preview: event.Preview, Path: event.Path,
 	}
+}
+
+func normalizeCatchUpEvent(event domain.ActivityEvent, issues []domain.IssueSnapshot, prs []domain.PRSnapshot, viewer string) (domain.ActivityEvent, string, string, string, []string) {
+	if pr, ok := findPR(prs, event.Number); ok {
+		event.Kind = "pull_request"
+		return event, pr.Title, pr.URL, pr.State, mergeStrings(involvementForPR(pr, viewer), involvementForActor(event.Actor, viewer, event.EventType))
+	}
+	if issue, ok := findIssue(issues, event.Number); ok {
+		event.Kind = "issue"
+		return event, issue.Title, issue.URL, issue.State, mergeStrings(involvementForIssue(issue, viewer), involvementForActor(event.Actor, viewer, event.EventType))
+	}
+	return event, "", "", "", involvementForActor(event.Actor, viewer, event.EventType)
+}
+
+func normalizeActivityEvent(event domain.ActivityEvent, issues []domain.IssueSnapshot, prs []domain.PRSnapshot) (domain.ActivityEvent, string, string, string, bool) {
+	if pr, ok := findPR(prs, event.Number); ok {
+		event.Kind = "pull_request"
+		return event, pr.Title, pr.URL, pr.State, true
+	}
+	if issue, ok := findIssue(issues, event.Number); ok {
+		event.Kind = "issue"
+		return event, issue.Title, issue.URL, issue.State, true
+	}
+	return event, "", "", "", false
 }
 
 func sortActivityEntries(entries []domain.ActivityEntry) {
@@ -2354,12 +3182,13 @@ func sortActivityEntries(entries []domain.ActivityEntry) {
 	})
 }
 
-func recoverNotificationPreviews(ctx context.Context, app app, owner, repo, since, viewer string, index map[string]*domain.CatchUpEntry) []string {
-	const maxRecoveries = 10
+func recoverNotificationPreviews(ctx context.Context, app app, owner, repo, since, viewer string, index map[string]*domain.CatchUpEntry, budget catchUpBudget) []string {
 	var warnings []string
-	recovered := 0
+	fetches := 0
+	truncated := false
 	for _, entry := range index {
-		if recovered >= maxRecoveries {
+		if fetches >= budget.MaxRecoveryFetches {
+			truncated = true
 			break
 		}
 		if len(entry.NotificationReasons) == 0 {
@@ -2372,8 +3201,13 @@ func recoverNotificationPreviews(ctx context.Context, app app, owner, repo, sinc
 		var err error
 		switch entry.Kind {
 		case "pull_request":
+			if fetches+2 > budget.MaxRecoveryFetches {
+				truncated = true
+				break
+			}
 			comments, cerr := app.backend.ListPullRequestThreadComments(ctx, owner, repo, entry.Number)
 			reviews, rerr := app.backend.ListPullRequestThreadReviews(ctx, owner, repo, entry.Number)
+			fetches += 2
 			if cerr != nil {
 				warnings = append(warnings, fmt.Sprintf("recover pr comments for %s/%s#%d: %v", owner, repo, entry.Number, cerr))
 			}
@@ -2383,15 +3217,21 @@ func recoverNotificationPreviews(ctx context.Context, app app, owner, repo, sinc
 			events = append(events, comments...)
 			events = append(events, reviews...)
 		default:
+			if fetches+1 > budget.MaxRecoveryFetches {
+				truncated = true
+				break
+			}
 			events, err = app.backend.ListIssueThreadComments(ctx, owner, repo, entry.Number)
+			fetches++
 			if err != nil {
 				warnings = append(warnings, fmt.Sprintf("recover issue comments for %s/%s#%d: %v", owner, repo, entry.Number, err))
 				continue
 			}
 		}
-		if applyRecoveredPreview(entry, events, viewer, since) {
-			recovered++
-		}
+		_ = applyRecoveredPreview(entry, events, viewer, since)
+	}
+	if truncated {
+		warnings = append(warnings, fmt.Sprintf("preview recovery budget hit for %s/%s after %d fetches", owner, repo, fetches))
 	}
 	return warnings
 }
@@ -2420,6 +3260,9 @@ func applyRecoveredPreview(entry *domain.CatchUpEntry, events []domain.ActivityE
 	if best == nil {
 		return false
 	}
+	if best.Preview == "" {
+		return false
+	}
 	entry.LatestActor = best.Actor
 	entry.LatestAt = best.OccurredAt
 	switch {
@@ -2442,7 +3285,7 @@ func matchesNotificationReason(reasons []string, event domain.ActivityEvent, vie
 		return true
 	}
 	if contains(reasons, "mention") || contains(reasons, "team_mention") {
-		return strings.Contains(strings.ToLower(event.Preview), "@"+strings.ToLower(viewer))
+		return exactMentionMatch(event.Preview, viewer)
 	}
 	return false
 }
@@ -2587,6 +3430,14 @@ func collectWatchedItemEntry(ctx context.Context, app app, iw config.ItemWatch, 
 
 	switch iw.Kind {
 	case "pr":
+		issueComments, icerr := app.backend.ListIssueThreadComments(ctx, iw.Owner, iw.Repo, iw.Number)
+		if icerr != nil {
+			if github.IsKind(icerr, github.ErrRateLimited) {
+				warnings = append(warnings, fmt.Sprintf("rate-limited fetching pr issue comments for %s/%s#%d (partial)", iw.Owner, iw.Repo, iw.Number))
+			} else {
+				warnings = append(warnings, fmt.Sprintf("pr issue comments for %s/%s#%d: %v", iw.Owner, iw.Repo, iw.Number, icerr))
+			}
+		}
 		comments, cerr := app.backend.ListPullRequestThreadComments(ctx, iw.Owner, iw.Repo, iw.Number)
 		if cerr != nil {
 			if github.IsKind(cerr, github.ErrRateLimited) {
@@ -2603,28 +3454,36 @@ func collectWatchedItemEntry(ctx context.Context, app app, iw config.ItemWatch, 
 				warnings = append(warnings, fmt.Sprintf("pr reviews for %s/%s#%d: %v", iw.Owner, iw.Repo, iw.Number, rerr))
 			}
 		}
+		events = append(events, issueComments...)
 		events = append(events, comments...)
 		events = append(events, reviews...)
 
-		// Also fetch current PR state.
-		prs, perr := app.backend.ListRepoPRs(ctx, iw.Owner, iw.Repo, github.PRQuery{State: "all"})
-		if perr == nil {
-			if pr, ok := findPR(prs, iw.Number); ok {
-				entry.Title = pr.Title
-				entry.URL = pr.URL
-				entry.State = pr.State
-				// Include state-change events.
-				if pr.MergedAt != nil && withinSinceReport(since, pr.MergedAt) {
-					events = append(events, domain.ActivityEvent{
-						Repo: iw.Repo, Owner: iw.Owner, Number: iw.Number, Kind: "pull_request",
-						EventType: "merged", Actor: pr.Author, OccurredAt: *pr.MergedAt,
-					})
-				} else if pr.ClosedAt != nil && withinSinceReport(since, pr.ClosedAt) {
-					events = append(events, domain.ActivityEvent{
-						Repo: iw.Repo, Owner: iw.Owner, Number: iw.Number, Kind: "pull_request",
-						EventType: "closed", Actor: pr.Author, OccurredAt: *pr.ClosedAt,
-					})
+		// Also fetch current PR state directly.
+		pr, perr := app.backend.GetPullRequest(ctx, iw.Owner, iw.Repo, iw.Number)
+		if perr != nil {
+			if github.IsKind(perr, github.ErrRateLimited) {
+				warnings = append(warnings, fmt.Sprintf("rate-limited fetching pr state for %s/%s#%d (partial)", iw.Owner, iw.Repo, iw.Number))
+			} else {
+				warnings = append(warnings, fmt.Sprintf("pr state for %s/%s#%d: %v", iw.Owner, iw.Repo, iw.Number, perr))
+			}
+		} else {
+			entry.Title = pr.Title
+			entry.URL = pr.URL
+			entry.State = pr.State
+			if pr.MergedAt != nil && withinSinceReport(since, pr.MergedAt) {
+				mergedBy := pr.MergedBy
+				if mergedBy == "" {
+					mergedBy = pr.Author
 				}
+				events = append(events, domain.ActivityEvent{
+					Repo: iw.Repo, Owner: iw.Owner, Number: iw.Number, Kind: "pull_request",
+					EventType: "merged", Actor: mergedBy, OccurredAt: *pr.MergedAt,
+				})
+			} else if pr.ClosedAt != nil && withinSinceReport(since, pr.ClosedAt) {
+				events = append(events, domain.ActivityEvent{
+					Repo: iw.Repo, Owner: iw.Owner, Number: iw.Number, Kind: "pull_request",
+					EventType: "closed", Actor: pr.Author, OccurredAt: *pr.ClosedAt,
+				})
 			}
 		}
 	default: // "issue"
@@ -2638,19 +3497,23 @@ func collectWatchedItemEntry(ctx context.Context, app app, iw config.ItemWatch, 
 		}
 		events = comments
 
-		// Also fetch current issue state.
-		issues, ierr := app.backend.ListRepoIssues(ctx, iw.Owner, iw.Repo, github.IssueQuery{State: "all"})
-		if ierr == nil {
-			if issue, ok := findIssue(issues, iw.Number); ok {
-				entry.Title = issue.Title
-				entry.URL = issue.URL
-				entry.State = issue.State
-				if issue.ClosedAt != nil && withinSinceReport(since, issue.ClosedAt) {
-					events = append(events, domain.ActivityEvent{
-						Repo: iw.Repo, Owner: iw.Owner, Number: iw.Number, Kind: "issue",
-						EventType: "closed", Actor: issue.Author, OccurredAt: *issue.ClosedAt,
-					})
-				}
+		// Also fetch current issue state directly.
+		issue, ierr := app.backend.GetIssue(ctx, iw.Owner, iw.Repo, iw.Number)
+		if ierr != nil {
+			if github.IsKind(ierr, github.ErrRateLimited) {
+				warnings = append(warnings, fmt.Sprintf("rate-limited fetching issue state for %s/%s#%d (partial)", iw.Owner, iw.Repo, iw.Number))
+			} else {
+				warnings = append(warnings, fmt.Sprintf("issue state for %s/%s#%d: %v", iw.Owner, iw.Repo, iw.Number, ierr))
+			}
+		} else {
+			entry.Title = issue.Title
+			entry.URL = issue.URL
+			entry.State = issue.State
+			if issue.ClosedAt != nil && withinSinceReport(since, issue.ClosedAt) {
+				events = append(events, domain.ActivityEvent{
+					Repo: iw.Repo, Owner: iw.Owner, Number: iw.Number, Kind: "issue",
+					EventType: "closed", Actor: issue.Author, OccurredAt: *issue.ClosedAt,
+				})
 			}
 		}
 	}
@@ -2683,4 +3546,42 @@ func collectWatchedItems(ctx context.Context, app app, cfg *config.Config, since
 		entries = append(entries, entry)
 	}
 	return entries, warnings
+}
+
+func filterWatchedItemsAgainstCatchUpEntries(items []domain.WatchedItemEntry, entries []domain.CatchUpEntry) []domain.WatchedItemEntry {
+	covered := map[string]bool{}
+	for _, entry := range entries {
+		covered[watchItemKey(entry.Owner, entry.Repo, entry.Number, entry.Kind)] = true
+	}
+	return filterWatchedItemsByCoverage(items, covered)
+}
+
+func filterWatchedItemsAgainstActivityEntries(items []domain.WatchedItemEntry, entries []domain.ActivityEntry) []domain.WatchedItemEntry {
+	covered := map[string]bool{}
+	for _, entry := range entries {
+		covered[watchItemKey(entry.Owner, entry.Repo, entry.Number, entry.Kind)] = true
+	}
+	return filterWatchedItemsByCoverage(items, covered)
+}
+
+func filterWatchedItemsByCoverage(items []domain.WatchedItemEntry, covered map[string]bool) []domain.WatchedItemEntry {
+	filtered := make([]domain.WatchedItemEntry, 0, len(items))
+	for _, item := range items {
+		if covered[watchItemKey(item.Owner, item.Repo, item.Number, item.Kind)] {
+			continue
+		}
+		filtered = append(filtered, item)
+	}
+	return filtered
+}
+
+func watchItemKey(owner, repo string, number int, kind string) string {
+	return fmt.Sprintf("%s/%s#%d:%s", owner, repo, number, normalizeWatchKind(kind))
+}
+
+func normalizeWatchKind(kind string) string {
+	if kind == "pr" {
+		return "pull_request"
+	}
+	return kind
 }

@@ -23,6 +23,8 @@ type Renderer interface {
 	RenderActivity(io.Writer, domain.ActivityReport) error
 	RenderProjectInspect(io.Writer, domain.ProjectSchema) error
 	RenderRepoInspect(io.Writer, domain.RepoSnapshot) error
+	RenderIssueInspect(io.Writer, domain.IssueSnapshot) error
+	RenderPRInspect(io.Writer, domain.PRSnapshot) error
 }
 
 type Factory struct{}
@@ -215,6 +217,35 @@ func (TextRenderer) RenderRepoInspect(w io.Writer, repo domain.RepoSnapshot) err
 	return nil
 }
 
+func (TextRenderer) RenderIssueInspect(w io.Writer, issue domain.IssueSnapshot) error {
+	fmt.Fprintf(w, "Issue: %s/%s#%d\nTitle: %s\nURL: %s\nState: %s\nAuthor: %s\n",
+		issue.Owner, issue.Repo, issue.Number, issue.Title, issue.URL, issue.State, displayActor(issue.Author))
+	if len(issue.Assignees) > 0 {
+		fmt.Fprintf(w, "Assignees: %s\n", strings.Join(issue.Assignees, ", "))
+	}
+	if len(issue.Labels) > 0 {
+		fmt.Fprintf(w, "Labels: %s\n", strings.Join(issue.Labels, ", "))
+	}
+	fmt.Fprintf(w, "Updated: %s\n", issue.UpdatedAt.Format("2006-01-02 15:04:05Z07:00"))
+	return nil
+}
+
+func (TextRenderer) RenderPRInspect(w io.Writer, pr domain.PRSnapshot) error {
+	fmt.Fprintf(w, "Pull Request: %s/%s#%d\nTitle: %s\nURL: %s\nState: %s\nAuthor: %s\n",
+		pr.Owner, pr.Repo, pr.Number, pr.Title, pr.URL, pr.State, displayActor(pr.Author))
+	if pr.MergedBy != "" {
+		fmt.Fprintf(w, "Merged By: %s\n", displayActor(pr.MergedBy))
+	}
+	if len(pr.Assignees) > 0 {
+		fmt.Fprintf(w, "Assignees: %s\n", strings.Join(pr.Assignees, ", "))
+	}
+	if len(pr.RequestedReviewers) > 0 {
+		fmt.Fprintf(w, "Requested Reviewers: %s\n", strings.Join(pr.RequestedReviewers, ", "))
+	}
+	fmt.Fprintf(w, "Updated: %s\n", pr.UpdatedAt.Format("2006-01-02 15:04:05Z07:00"))
+	return nil
+}
+
 type JSONRenderer struct{}
 
 func (JSONRenderer) RenderManager(w io.Writer, report domain.ManagerReport) error {
@@ -237,6 +268,14 @@ func (JSONRenderer) RenderProjectInspect(w io.Writer, schema domain.ProjectSchem
 
 func (JSONRenderer) RenderRepoInspect(w io.Writer, repo domain.RepoSnapshot) error {
 	return json.NewEncoder(w).Encode(repo)
+}
+
+func (JSONRenderer) RenderIssueInspect(w io.Writer, issue domain.IssueSnapshot) error {
+	return json.NewEncoder(w).Encode(issue)
+}
+
+func (JSONRenderer) RenderPRInspect(w io.Writer, pr domain.PRSnapshot) error {
+	return json.NewEncoder(w).Encode(pr)
 }
 
 type MarkdownRenderer struct{ TextRenderer }
@@ -435,6 +474,14 @@ func (m MarkdownRenderer) RenderRepoInspect(w io.Writer, repo domain.RepoSnapsho
 	return m.TextRenderer.RenderRepoInspect(w, repo)
 }
 
+func (m MarkdownRenderer) RenderIssueInspect(w io.Writer, issue domain.IssueSnapshot) error {
+	return m.TextRenderer.RenderIssueInspect(w, issue)
+}
+
+func (m MarkdownRenderer) RenderPRInspect(w io.Writer, pr domain.PRSnapshot) error {
+	return m.TextRenderer.RenderPRInspect(w, pr)
+}
+
 func SyncNextMarkdown(existing string, report domain.NextReport) (string, error) {
 	var b strings.Builder
 	if err := (MarkdownRenderer{}).RenderNext(&b, report); err != nil {
@@ -506,7 +553,7 @@ func rawStatusValue(fields map[string]string) string {
 }
 
 func managerSummaryLines(summary map[string]int) []string {
-	order := []string{"total", "issues", "prs", "review_needed", "workflow_runs", "open", "in_progress", "in_review", "blocked", "done", "unknown"}
+	order := []string{"total", "issues", "prs", "review_needed", "workflow_runs", "board_ready", "board_in_progress", "board_in_review", "board_blocked", "board_done", "board_backlog", "board_unknown", "open", "in_progress", "in_review", "blocked", "done", "unknown"}
 	seen := map[string]bool{}
 	var lines []string
 	for _, key := range order {

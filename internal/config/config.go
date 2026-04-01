@@ -8,7 +8,10 @@ import (
 	"path/filepath"
 	"slices"
 	"strings"
+	"syscall"
+	"time"
 
+	"github.com/adrian1-dot/ferret/internal/fsutil"
 	"gopkg.in/yaml.v3"
 )
 
@@ -80,6 +83,7 @@ type ProjectWatch struct {
 type Store interface {
 	Load(ctx context.Context) (*Config, error)
 	Save(ctx context.Context, cfg *Config) error
+	Update(ctx context.Context, mutate func(*Config) error) error
 }
 
 type FileStore struct {
@@ -122,21 +126,80 @@ func (s FileStore) Save(_ context.Context, cfg *Config) error {
 		return err
 	}
 	path := s.path()
-	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
-		return err
-	}
 	data, err := yaml.Marshal(cfg)
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(path, data, 0o644)
+	return fsutil.AtomicWriteFile(path, data)
+}
+
+func (s FileStore) Update(ctx context.Context, mutate func(*Config) error) error {
+	path := s.path()
+	lockPath := path + ".lock"
+	if err := os.MkdirAll(filepath.Dir(lockPath), 0o755); err != nil {
+		return err
+	}
+	lockFile, err := os.OpenFile(lockPath, os.O_CREATE|os.O_RDWR, 0o644)
+	if err != nil {
+		return err
+	}
+	defer lockFile.Close()
+	if err := lockWithContext(ctx, lockFile); err != nil {
+		return err
+	}
+	defer syscall.Flock(int(lockFile.Fd()), syscall.LOCK_UN)
+
+	cfg, err := s.Load(ctx)
+	if err != nil {
+		return err
+	}
+	if err := mutate(cfg); err != nil {
+		return err
+	}
+	return s.Save(ctx, cfg)
 }
 
 func (s FileStore) path() string {
 	if s.Path == "" {
-		return DefaultConfigPath
+		return ExpandPath(DefaultConfigPath)
 	}
-	return s.Path
+	return ExpandPath(s.Path)
+}
+
+func ExpandPath(path string) string {
+	if path == "" {
+		return ""
+	}
+	if path == "~" {
+		if home, err := os.UserHomeDir(); err == nil {
+			return home
+		}
+		return path
+	}
+	prefix := "~" + string(os.PathSeparator)
+	if strings.HasPrefix(path, prefix) {
+		if home, err := os.UserHomeDir(); err == nil {
+			return filepath.Join(home, path[len(prefix):])
+		}
+	}
+	return path
+}
+
+func lockWithContext(ctx context.Context, f *os.File) error {
+	for {
+		err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB)
+		if err == nil {
+			return nil
+		}
+		if !errors.Is(err, syscall.EWOULDBLOCK) {
+			return err
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(10 * time.Millisecond):
+		}
+	}
 }
 
 func Validate(cfg *Config) error {
@@ -283,7 +346,9 @@ func ResolveProject(cfg *Config, alias string) (*ProjectWatch, error) {
 		if p.Alias == alias {
 			cp := p
 			if cp.Output.PlanFile == "" {
-				cp.Output.PlanFile = filepath.Join(cfg.Defaults.PlanDir, alias+".md")
+				cp.Output.PlanFile = filepath.Join(ExpandPath(cfg.Defaults.PlanDir), alias+".md")
+			} else {
+				cp.Output.PlanFile = ExpandPath(cp.Output.PlanFile)
 			}
 			return &cp, nil
 		}

@@ -58,6 +58,8 @@ func IsKind(err error, kind ErrorKind) bool {
 type Backend interface {
 	GetViewer(ctx context.Context) (string, error)
 	GetRepo(ctx context.Context, owner, repo string) (domain.RepoSnapshot, error)
+	GetIssue(ctx context.Context, owner, repo string, number int) (domain.IssueSnapshot, error)
+	GetPullRequest(ctx context.Context, owner, repo string, number int) (domain.PRSnapshot, error)
 	ListUserRecentRepos(ctx context.Context, limit int) ([]domain.RepoSnapshot, error)
 	ListRepoIssues(ctx context.Context, owner, repo string, q IssueQuery) ([]domain.IssueSnapshot, error)
 	ListRepoPRs(ctx context.Context, owner, repo string, q PRQuery) ([]domain.PRSnapshot, error)

@@ -82,3 +82,27 @@ func TestResolveSafeWritePathRejectsDoubleDotInMiddle(t *testing.T) {
 		t.Fatal("expected error for '..' in middle of path")
 	}
 }
+
+func TestResolveApprovedWritePathRejectsEscapeOutsideRoot(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	root := filepath.Join(dir, ".ferret")
+	_, err := fsutil.ResolveApprovedWritePath(filepath.Join(dir, "notes.md"), root)
+	if err == nil {
+		t.Fatal("expected path outside approved root to be rejected")
+	}
+}
+
+func TestResolveApprovedWritePathAcceptsAbsolutePathInsideRoot(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	root := filepath.Join(dir, ".ferret")
+	path := filepath.Join(root, "plans", "next.md")
+	got, err := fsutil.ResolveApprovedWritePath(path, root)
+	if err != nil {
+		t.Fatalf("ResolveApprovedWritePath: %v", err)
+	}
+	if got != path {
+		t.Fatalf("expected %q, got %q", path, got)
+	}
+}

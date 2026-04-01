@@ -45,9 +45,10 @@ Watch specific issues or PRs you care about regardless of repo scope:
 ```bash
 ./ferret watch issue OWNER/REPO NUMBER --alias my-issue
 ./ferret watch pr OWNER/REPO NUMBER --alias my-pr
+./ferret watch pr OWNER/REPO#NUMBER --alias my-pr
 ```
 
-Watched items appear in a separate "Watched Items" section in `catch-up` and `activity` output.
+Watched items appear in a separate "Watched Items" section in `catch-up` and `activity` output only when they are not already covered by the main scoped results.
 
 Add a GitHub Project later if you want board-aware summaries:
 
@@ -61,11 +62,11 @@ Add a GitHub Project later if you want board-aware summaries:
 
 - **watched repo**: a repo Ferret tracks by alias — the primary scope for all commands
 - **watched project**: a GitHub Project v2 tracked by alias — adds board items to `manager` and `next`
-- **watched item**: a single issue or PR tracked by alias — always included in `catch-up` and `activity` regardless of scope
+- **watched item**: a single issue or PR tracked by alias; it can be targeted directly in `inspect`, `activity`, and `catch-up`
 - `catch-up`: changed items only, good for daily review; cursor-backed so it picks up where it left off
 - `activity`: raw chronological events in the scope; cursor-backed
-- `manager`: broad factual snapshot — issues, PRs, review status, workflow runs
-- `next`: open work grouped by action readiness
+- `manager`: broad factual snapshot — issues, PRs, review status, workflow runs; in project mode with `status_field` configured, board counts are rendered as `board_*`
+- `next`: open work grouped by action readiness, not a board-ground-truth report
 
 ## Requirements
 
@@ -83,6 +84,8 @@ Token resolution order:
 GitHub API rate limits apply; very large scopes or deep time windows may produce partial results.
 
 Run `ferret doctor` to verify your local setup.
+
+Pre-built release packaging is configured in this repo via GitHub Actions and Goreleaser.
 
 ## Recommended Workflow
 
@@ -128,6 +131,14 @@ Project-based `next` reports default to:
 .ferret/plans/<alias>.md
 ```
 
+Paths passed via `--config`, `--out`, `--plan-file`, and configured plan/output paths expand `~`.
+
+By default, Ferret only writes inside repo-local `.ferret/` roots:
+- config and report outputs stay under `.ferret/`
+- plan files stay under `.ferret/plans/`
+
+Use `--allow-outside-workspace` only when you intentionally want config or output paths outside those roots.
+
 ## Commands
 
 Setup:
@@ -143,13 +154,17 @@ Watch management:
 ferret watch repo OWNER/REPO --alias my-repo
 ferret watch project OWNER/NUMBER --alias my-board --link-repo my-repo
 ferret watch issue OWNER/REPO NUMBER --alias my-issue
+ferret watch issue OWNER/REPO#NUMBER --alias my-issue
 ferret watch pr OWNER/REPO NUMBER --alias my-pr
+ferret watch pr OWNER/REPO#NUMBER --alias my-pr
 ferret watch list
 
 ferret unwatch repo my-repo
 ferret unwatch project my-board
 ferret unwatch issue my-issue
+ferret unwatch issue OWNER/REPO#NUMBER
 ferret unwatch pr my-pr
+ferret unwatch pr OWNER/REPO#NUMBER
 ```
 
 Inspect:
@@ -157,6 +172,17 @@ Inspect:
 ```bash
 ferret inspect repo <owner>/<repo>|<alias>
 ferret inspect project <owner>/<number>|<alias>
+ferret inspect issue <owner>/<repo>#<number>|<alias>
+ferret inspect pr <owner>/<repo>#<number>|<alias>
+```
+
+Watched item targeting:
+
+```bash
+ferret inspect issue atlas-481
+ferret inspect pr txpipe/dolos#872
+ferret activity dolos-pr-872 --since 90d
+ferret catch-up atlas-481 --since 30d
 ```
 
 Daily use:
@@ -205,15 +231,17 @@ ferret catch-up --since 1d --me
 ferret activity my-repo --since 3d
 ```
 
-`manager` and `next` do not use cursors.
+`manager` does not use cursors.
+
+`next` does not use cursors and defaults to the last `30d` when no explicit or per-alias `since` value is set.
 
 ## Output Formats
 
 All report commands support `--out` and `--format`:
 
 ```bash
-ferret catch-up my-repo --out catchup.md        # writes markdown
-ferret catch-up my-repo --out catchup.json       # writes JSON (from extension)
+ferret catch-up my-repo --out .ferret/catchup.md # writes markdown
+ferret catch-up my-repo --out .ferret/catchup.json # writes JSON (from extension)
 ferret manager my-repo --format json             # JSON to stdout
 ```
 
@@ -224,12 +252,15 @@ The `.json` file extension selects JSON format automatically. Any other extensio
 
 Ferret makes one or more GitHub API calls per command. For `catch-up`:
 
-- Review fetches scale with the number of open PRs in scope
-- When more than 20 PRs are in scope, a warning is printed to stderr
+- Open PR count still affects how much review-related work is in scope
+- Review expansion is capped to a safe default budget; when truncated, Ferret emits an explicit warning
+- That budget only affects deep review-thread expansion, not the base issue/PR facts returned by the command
+- When the budget is hit, Ferret expands PRs using already-fetched GitHub signals such as review requests, notifications, direct involvement, and recency
 - Rate-limit errors from GitHub surface as partial-report warnings — the command
   does not crash; results up to the limit are still returned
+- Preview recovery is also budgeted and warns when deeper recovery is skipped
 
-There is no internal request cap. GitHub's rate limit is the real backstop.
+GitHub's rate limit remains the backstop, but Ferret now bounds the deepest `catch-up` fetches before they fan out too far.
 
 ## Example Output
 
