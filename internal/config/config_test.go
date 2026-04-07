@@ -57,6 +57,44 @@ func TestValidateAcceptsNormalOutputDir(t *testing.T) {
 	}
 }
 
+func TestValidateRejectsInvalidCatchUpExpandOrder(t *testing.T) {
+	t.Parallel()
+	cfg := Default()
+	cfg.Defaults.CatchUp.ExpandOrder = "mine"
+	err := Validate(cfg)
+	if err == nil {
+		t.Fatal("expected error for invalid catch-up expand order")
+	}
+	if !strings.Contains(err.Error(), "expand_order") {
+		t.Fatalf("expected error to name the field, got: %s", err.Error())
+	}
+}
+
+func TestNormalizeCatchUpExpandOrder(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		in   string
+		want string
+	}{
+		{"", DefaultCatchUpExpandOrder},
+		{"balanced", DefaultCatchUpExpandOrder},
+		{"BALANCED", DefaultCatchUpExpandOrder},
+		{"recency", "recency"},
+	}
+	for _, tc := range cases {
+		got, err := NormalizeCatchUpExpandOrder(tc.in)
+		if err != nil {
+			t.Fatalf("NormalizeCatchUpExpandOrder(%q): %v", tc.in, err)
+		}
+		if got != tc.want {
+			t.Fatalf("NormalizeCatchUpExpandOrder(%q) = %q, want %q", tc.in, got, tc.want)
+		}
+	}
+	if _, err := NormalizeCatchUpExpandOrder("watched"); err == nil {
+		t.Fatal("expected invalid expansion order to fail")
+	}
+}
+
 func TestValidateItemWatchRequiresKind(t *testing.T) {
 	t.Parallel()
 	cfg := Default()

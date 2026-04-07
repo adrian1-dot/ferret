@@ -393,13 +393,7 @@ query($owner: String!, $repo: String!, $states: [PullRequestState!], $after: Str
 }
 
 func (b *HTTPBackend) listRepoPRsRESTFallback(ctx context.Context, owner, repo string, q PRQuery, viewer string) ([]domain.PRSnapshot, error) {
-	state := strings.ToLower(defaultString(q.State, "open"))
-	restState := state
-	if state == "merged" {
-		restState = "closed"
-	}
-	path := fmt.Sprintf("/repos/%s/%s/pulls?state=%s&sort=updated&direction=desc&per_page=100", owner, repo, restState)
-	var out []struct {
+	type restPR struct {
 		Number    int        `json:"number"`
 		Title     string     `json:"title"`
 		HTMLURL   string     `json:"html_url"`
@@ -422,8 +416,40 @@ func (b *HTTPBackend) listRepoPRsRESTFallback(ctx context.Context, owner, repo s
 			Login string `json:"login"`
 		} `json:"requested_reviewers"`
 	}
-	if err := b.getPaged(ctx, &out, path); err != nil {
-		return nil, err
+	state := strings.ToLower(defaultString(q.State, "open"))
+	restState := state
+	if state == "merged" {
+		restState = "closed"
+	}
+	url := apiBase + fmt.Sprintf("/repos/%s/%s/pulls?state=%s&sort=updated&direction=desc&per_page=100", owner, repo, restState)
+	var out []restPR
+	for url != "" {
+		req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
+		if err != nil {
+			return nil, err
+		}
+		b.setHeaders(req)
+		resp, err := b.client.Do(req)
+		if err != nil {
+			return nil, fmt.Errorf("GET %s: %w", url, err)
+		}
+		body, err := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if err != nil {
+			return nil, fmt.Errorf("read response body: %w", err)
+		}
+		if resp.StatusCode >= 400 {
+			return nil, classifyHTTPError(resp.StatusCode, body, url)
+		}
+		var page []restPR
+		if err := json.Unmarshal(body, &page); err != nil {
+			return nil, fmt.Errorf("decode page: %w", err)
+		}
+		out = append(out, page...)
+		if q.Since != "" && len(page) > 0 && !withinSince(q.Since, page[len(page)-1].UpdatedAt) {
+			break
+		}
+		url = nextLink(resp.Header.Get("Link"))
 	}
 	var prs []domain.PRSnapshot
 	for _, item := range out {
@@ -483,8 +509,8 @@ func shouldFallbackRepoPRs(err error) bool {
 			strings.Contains(ghErr.Message, "HTTP 503") ||
 			strings.Contains(ghErr.Message, "HTTP 504")
 	}
-	msg := err.Error()
-	return strings.HasPrefix(msg, "GraphQL: ")
+	msg := strings.ToLower(err.Error())
+	return strings.HasPrefix(msg, "graphql: ") || strings.HasPrefix(msg, "read graphql response: ")
 }
 
 func (b *HTTPBackend) ListWorkflowRuns(ctx context.Context, owner, repo string, q WorkflowQuery) ([]domain.WorkflowSnapshot, error) {

@@ -20,6 +20,7 @@ type fakeBackend struct {
 	viewer                     string
 	issues                     []domain.IssueSnapshot
 	prs                        []domain.PRSnapshot
+	projectItems               []domain.ProjectItem
 	workflowRuns               []domain.WorkflowSnapshot
 	issueComments              []domain.ActivityEvent
 	reviewComments             []domain.ActivityEvent
@@ -27,6 +28,7 @@ type fakeBackend struct {
 	threadReviewCommentsByPR   map[int][]domain.ActivityEvent
 	threadReviewsByPR          map[int][]domain.ActivityEvent
 	repoNotifications          []domain.NotificationThread
+	lastProjectItemsQuery      github.ProjectItemsQuery
 	listRepoPRsCalls           int
 	listPullRequestReviewCalls int
 }
@@ -107,8 +109,9 @@ func (f *fakeBackend) GetProjectSchema(context.Context, string, int) (domain.Pro
 	return domain.ProjectSchema{}, fmt.Errorf("not implemented")
 }
 
-func (f *fakeBackend) ListProjectItems(context.Context, string, int, github.ProjectItemsQuery) ([]domain.ProjectItem, error) {
-	return nil, fmt.Errorf("not implemented")
+func (f *fakeBackend) ListProjectItems(_ context.Context, _ string, _ int, q github.ProjectItemsQuery) ([]domain.ProjectItem, error) {
+	f.lastProjectItemsQuery = q
+	return append([]domain.ProjectItem(nil), f.projectItems...), nil
 }
 
 func withWorkingDir(t *testing.T, dir string) {
@@ -227,6 +230,39 @@ func TestSummarizeProjectItemsUsesBoardScopedKeysAndWarnings(t *testing.T) {
 	}
 }
 
+func TestLoadProjectItemsForSnapshotIgnoresSinceAndNormalizesItems(t *testing.T) {
+	t.Parallel()
+
+	backend := &fakeBackend{
+		viewer: "alice",
+		projectItems: []domain.ProjectItem{{
+			Number:    12,
+			Title:     "Board item",
+			State:     "OPEN",
+			UpdatedAt: time.Date(2026, 1, 15, 10, 0, 0, 0, time.UTC),
+			Assignees: []string{"alice"},
+			FieldValues: map[string]string{
+				"Status":   "In progress",
+				"Priority": "High",
+			},
+		}},
+	}
+
+	items, err := loadProjectItemsForSnapshot(context.Background(), backend, "acme", 12, "alice", "Status")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if backend.lastProjectItemsQuery.Since != "" {
+		t.Fatalf("expected project snapshot fetch to ignore since, got %#v", backend.lastProjectItemsQuery)
+	}
+	if len(items) != 1 {
+		t.Fatalf("expected one project item, got %#v", items)
+	}
+	if !items[0].AssignedToMe || items[0].BoardStatus != "In progress" || items[0].Status != domain.StatusInProgress {
+		t.Fatalf("unexpected normalized project item: %#v", items[0])
+	}
+}
+
 func TestResolveNextFilterSupportsMeAlias(t *testing.T) {
 	t.Parallel()
 	got, err := resolveNextFilter("", true)
@@ -282,7 +318,7 @@ func TestBoundedPRsForReviewFetchTruncatesAtBudget(t *testing.T) {
 	}
 }
 
-func TestPrioritizePRsForReviewFetchPrefersNotificationAndViewerSignals(t *testing.T) {
+func TestPrioritizePRsForReviewFetchBalancedPrefersNotificationAndViewerSignals(t *testing.T) {
 	t.Parallel()
 	prs := []domain.PRSnapshot{
 		{
@@ -307,7 +343,7 @@ func TestPrioritizePRsForReviewFetchPrefersNotificationAndViewerSignals(t *testi
 		{Number: 3, Kind: "pull_request", Reason: "mention"},
 	}
 
-	got := prioritizePRsForReviewFetch(prs, notifications, "adrian1-dot")
+	got := prioritizePRsForReviewFetch(prs, notifications, "adrian1-dot", "balanced")
 	if len(got) != 3 {
 		t.Fatalf("unexpected prioritized PR list: %#v", got)
 	}
@@ -319,6 +355,89 @@ func TestPrioritizePRsForReviewFetchPrefersNotificationAndViewerSignals(t *testi
 	}
 	if got[2].Number != 1 {
 		t.Fatalf("expected plain recency-only PR last, got %#v", got)
+	}
+}
+
+func TestPrioritizePRsForReviewFetchRecencyUsesUpdatedAtOnly(t *testing.T) {
+	t.Parallel()
+	prs := []domain.PRSnapshot{
+		{
+			Number:             1,
+			State:              "OPEN",
+			UpdatedAt:          time.Date(2026, 4, 1, 11, 0, 0, 0, time.UTC),
+			RequestedReviewers: []string{"adrian1-dot"},
+		},
+		{
+			Number:    2,
+			State:     "OPEN",
+			UpdatedAt: time.Date(2026, 4, 1, 12, 0, 0, 0, time.UTC),
+		},
+		{
+			Number:    3,
+			State:     "OPEN",
+			UpdatedAt: time.Date(2026, 4, 1, 10, 0, 0, 0, time.UTC),
+		},
+	}
+	notifications := []domain.NotificationThread{
+		{Number: 3, Kind: "pull_request", Reason: "mention"},
+	}
+
+	got := prioritizePRsForReviewFetch(prs, notifications, "adrian1-dot", "recency")
+	if len(got) != 3 {
+		t.Fatalf("unexpected prioritized PR list: %#v", got)
+	}
+	if got[0].Number != 2 || got[1].Number != 1 || got[2].Number != 3 {
+		t.Fatalf("expected pure recency ordering, got %#v", got)
+	}
+}
+
+func TestResolveCatchUpExpandOrder(t *testing.T) {
+	t.Parallel()
+	cfg := config.Default()
+
+	got, err := resolveCatchUpExpandOrder(cfg, "")
+	if err != nil {
+		t.Fatalf("resolveCatchUpExpandOrder default: %v", err)
+	}
+	if got != config.DefaultCatchUpExpandOrder {
+		t.Fatalf("expected default expand order %q, got %q", config.DefaultCatchUpExpandOrder, got)
+	}
+
+	got, err = resolveCatchUpExpandOrder(cfg, "recency")
+	if err != nil {
+		t.Fatalf("resolveCatchUpExpandOrder override: %v", err)
+	}
+	if got != "recency" {
+		t.Fatalf("expected recency override, got %q", got)
+	}
+
+	cfg.Defaults.CatchUp.ExpandOrder = "recency"
+	got, err = resolveCatchUpExpandOrder(cfg, "")
+	if err != nil {
+		t.Fatalf("resolveCatchUpExpandOrder config: %v", err)
+	}
+	if got != "recency" {
+		t.Fatalf("expected config recency, got %q", got)
+	}
+
+	if _, err := resolveCatchUpExpandOrder(cfg, "watched"); err == nil {
+		t.Fatal("expected invalid override to fail")
+	}
+}
+
+func TestDoctorScopeHint(t *testing.T) {
+	t.Parallel()
+	if got := doctorScopeHint(true, true); got != "" {
+		t.Fatalf("expected no hint when scopes are complete, got %q", got)
+	}
+	if got := doctorScopeHint(false, false); !strings.Contains(got, "repo") || !strings.Contains(got, "project") {
+		t.Fatalf("expected combined scope hint, got %q", got)
+	}
+	if got := doctorScopeHint(false, true); !strings.Contains(got, "`repo`") {
+		t.Fatalf("expected repo-scope hint, got %q", got)
+	}
+	if got := doctorScopeHint(true, false); !strings.Contains(got, "repo mode will work") {
+		t.Fatalf("expected project-scope hint, got %q", got)
 	}
 }
 
@@ -787,7 +906,7 @@ func TestCollectCatchUpForRepoNormalizesPRIssueThreadComments(t *testing.T) {
 		}},
 	}
 
-	entries, warnings := collectCatchUpForRepo(context.Background(), app{backend: backend}, "acme", "api", "2026-03-20T00:00:00Z", "adrian1-dot", false, false, false, false, false, io.Discard)
+	entries, warnings := collectCatchUpForRepo(context.Background(), app{backend: backend}, "acme", "api", "2026-03-20T00:00:00Z", "adrian1-dot", false, false, false, false, false, "balanced", io.Discard)
 
 	if len(warnings) != 0 {
 		t.Fatalf("unexpected warnings: %#v", warnings)

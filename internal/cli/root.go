@@ -142,18 +142,24 @@ func newInitCmd(opts *rootOptions) *cobra.Command {
 			if err := app.store.Save(ctx, cfg); err != nil {
 				return err
 			}
+			res := auth.Check(ctx)
 			_, _ = fmt.Fprintf(cmd.OutOrStdout(), "Authenticated as @%s\n", login)
+			if res.Source != "" {
+				_, _ = fmt.Fprintf(cmd.OutOrStdout(), "Token source: %s\n", res.Source)
+			}
 			_, _ = fmt.Fprintf(cmd.OutOrStdout(), "Initialized Ferret config at %s\n\n", path)
 			_, _ = fmt.Fprintln(cmd.OutOrStdout(), "Recommended first steps:")
-			_, _ = fmt.Fprintln(cmd.OutOrStdout(), "1. Watch a repo (run without args to see recently active repos)")
+			_, _ = fmt.Fprintln(cmd.OutOrStdout(), "1. Verify auth and token scopes")
+			_, _ = fmt.Fprintln(cmd.OutOrStdout(), "   ferret doctor")
+			_, _ = fmt.Fprintln(cmd.OutOrStdout(), "2. Watch a repo (run without args to see recently active repos)")
 			_, _ = fmt.Fprintln(cmd.OutOrStdout(), "   ferret watch repo OWNER/REPO")
-			_, _ = fmt.Fprintln(cmd.OutOrStdout(), "2. See what changed")
+			_, _ = fmt.Fprintln(cmd.OutOrStdout(), "3. See what changed")
 			_, _ = fmt.Fprintln(cmd.OutOrStdout(), "   ferret catch-up my-repo --since 7d --me")
-			_, _ = fmt.Fprintln(cmd.OutOrStdout(), "3. Get a broad summary")
+			_, _ = fmt.Fprintln(cmd.OutOrStdout(), "4. Get a broad summary")
 			_, _ = fmt.Fprintln(cmd.OutOrStdout(), "   ferret manager my-repo --since 7d")
-			_, _ = fmt.Fprintln(cmd.OutOrStdout(), "4. Add a project later for board-aware summaries")
+			_, _ = fmt.Fprintln(cmd.OutOrStdout(), "5. Add a project later for board-aware summaries")
 			_, _ = fmt.Fprintln(cmd.OutOrStdout(), "   ferret watch project OWNER/NUMBER --alias my-board --link-repo my-repo")
-			_, _ = fmt.Fprintln(cmd.OutOrStdout(), "5. Inspect the board structure")
+			_, _ = fmt.Fprintln(cmd.OutOrStdout(), "6. Inspect the board structure")
 			_, _ = fmt.Fprintln(cmd.OutOrStdout(), "   ferret inspect project my-board")
 			return nil
 		},
@@ -637,7 +643,8 @@ Answers: what is the current state of this scope right now?
 
 The output includes open issues, open PRs (with review status), any PRs
 needing review, and recent workflow runs. When scoped to a project, project
-board items are included.
+board items are included as a current snapshot. In project mode, --since
+only scopes linked repo enrichment, not the board item list itself.
 
 Scoping:
 
@@ -714,17 +721,11 @@ Examples:
 					TargetKind:  "project",
 					Since:       effectiveSince,
 				}
-				items, err := app.backend.ListProjectItems(ctx, project.Owner, project.Number, github.ProjectItemsQuery{Limit: 100, Since: effectiveSince})
+				items, err := loadProjectItemsForSnapshot(ctx, app.backend, project.Owner, project.Number, viewer, project.StatusField)
 				if err != nil {
 					return err
 				}
 				boardLookup := buildBoardStatusLookup(project, items)
-				for i := range items {
-					items[i] = normalizeProjectItem(items[i], viewer, project.StatusField)
-					if project.StatusField != "" {
-						items[i].BoardStatus = items[i].FieldValues[project.StatusField]
-					}
-				}
 				items = filterItems(items, filter)
 				report.Items = items
 				report.Summary, report.Warnings = summarizeProjectItems(items, project.StatusField)
@@ -791,7 +792,8 @@ project — no --all flag is required. Omitting an alias (or passing --all)
 runs across every watched repo.
 
 This is an action view, not a board-ground-truth report. Use manager for a
-full project snapshot.
+full project snapshot. In project mode, --since only scopes linked repo
+enrichment; the board item set remains a current snapshot.
 
 Filter presets:
 
@@ -854,12 +856,9 @@ Examples:
 				return app.renderer.RenderNext(cmd.OutOrStdout(), report)
 			}
 			if project, err := config.ResolveProject(cfg, ref); err == nil {
-				items, err := app.backend.ListProjectItems(ctx, project.Owner, project.Number, github.ProjectItemsQuery{Limit: 100, Since: effectiveSince})
+				items, err := loadProjectItemsForSnapshot(ctx, app.backend, project.Owner, project.Number, viewer, project.StatusField)
 				if err != nil {
 					return err
-				}
-				for i := range items {
-					items[i] = normalizeProjectItem(items[i], viewer, project.StatusField)
 				}
 				report := buildProjectNextReport(project.Alias, items, effectiveSince, firstNonEmpty(filter, "actionable"))
 				report.TargetKind = "project"
@@ -908,6 +907,7 @@ func newCatchUpCmd(opts *rootOptions) *cobra.Command {
 	var openOnly bool
 	var commentsOnly bool
 	var reviewOnly bool
+	var expandOrder string
 	var out string
 	var all bool
 	cmd := &cobra.Command{
@@ -943,12 +943,13 @@ Note: deep review expansion and preview recovery use internal safety budgets.
 When those budgets are hit, Ferret emits explicit warnings and returns the
 best partial result it has. The budget only affects deep review-thread
 expansion, not the base issue and pull-request facts in scope. Under
-truncation, Ferret expands PRs using already-fetched GitHub signals such as
-review requests, notifications, direct involvement, and recency.
+truncation, Ferret defaults to a balanced expansion order based on already-
+fetched GitHub signals. Use --expand-order recency for a more neutral mode.
 
 Examples:
 
   ferret catch-up my-repo --me
+  ferret catch-up my-repo --expand-order recency
   ferret catch-up --since 7d
   ferret catch-up --all --me --out .ferret/catchup.md`,
 		Args: cobra.MaximumNArgs(1),
@@ -985,13 +986,17 @@ Examples:
 			if ref == "" {
 				all = true
 			}
+			resolvedExpandOrder, err := resolveCatchUpExpandOrder(cfg, expandOrder)
+			if err != nil {
+				return err
+			}
 			effectiveSince, usedCursor, err := resolveStatefulSince(ctx, app.state, "catch-up", defaultCursorScope(all, ref), since, defaultSinceForAlias(cfg, ref), "24h")
 			if err != nil {
 				return err
 			}
 			var report domain.CatchUpReport
 			if all {
-				report, err = buildAllReposCatchUpReport(ctx, app, cfg, effectiveSince, viewer, me, closedOnly, openOnly, commentsOnly, reviewOnly, cmd.ErrOrStderr())
+				report, err = buildAllReposCatchUpReport(ctx, app, cfg, effectiveSince, viewer, me, closedOnly, openOnly, commentsOnly, reviewOnly, resolvedExpandOrder, cmd.ErrOrStderr())
 				if err != nil {
 					return err
 				}
@@ -1032,7 +1037,7 @@ Examples:
 						sem <- struct{}{}
 						defer func() { <-sem }()
 						progressf(cmd.ErrOrStderr(), "fetching repo %s/%s", repo.Owner, repo.Name)
-						entries, warnings := collectCatchUpForRepo(ctx, app, repo.Owner, repo.Name, effectiveSince, viewer, me, closedOnly, openOnly, commentsOnly, reviewOnly, cmd.ErrOrStderr())
+						entries, warnings := collectCatchUpForRepo(ctx, app, repo.Owner, repo.Name, effectiveSince, viewer, me, closedOnly, openOnly, commentsOnly, reviewOnly, resolvedExpandOrder, cmd.ErrOrStderr())
 						results[i] = repoResult{entries: entries, warnings: warnings}
 					}()
 				}
@@ -1071,7 +1076,7 @@ Examples:
 					TargetKind:  "repo",
 					Since:       effectiveSince,
 				}
-				entries, warnings := collectCatchUpForRepo(ctx, app, repo.Owner, repo.Name, effectiveSince, viewer, me, closedOnly, openOnly, commentsOnly, reviewOnly, cmd.ErrOrStderr())
+				entries, warnings := collectCatchUpForRepo(ctx, app, repo.Owner, repo.Name, effectiveSince, viewer, me, closedOnly, openOnly, commentsOnly, reviewOnly, resolvedExpandOrder, cmd.ErrOrStderr())
 				report.Entries = entries
 				if len(warnings) > 0 {
 					report.Partial = true
@@ -1111,6 +1116,7 @@ Examples:
 	cmd.Flags().BoolVar(&openOnly, "open-only", false, "show only open (non-terminal) items")
 	cmd.Flags().BoolVar(&commentsOnly, "comments-only", false, "show only comment and review activity")
 	cmd.Flags().BoolVar(&reviewOnly, "review-only", false, "show only items where a review was requested")
+	cmd.Flags().StringVar(&expandOrder, "expand-order", "", "deep review expansion order: balanced or recency")
 	cmd.Flags().StringVar(&out, "out", "", "write output to file under .ferret/ by default (default format: markdown)")
 	cmd.Flags().BoolVar(&all, "all", false, "run across all watched repos")
 	return cmd
@@ -1579,6 +1585,20 @@ func summarizeProjectItems(items []domain.ProjectItem, statusField string) (map[
 	return out, warnings
 }
 
+func loadProjectItemsForSnapshot(ctx context.Context, backend github.Backend, owner string, number int, viewer, statusField string) ([]domain.ProjectItem, error) {
+	items, err := backend.ListProjectItems(ctx, owner, number, github.ProjectItemsQuery{Limit: 100})
+	if err != nil {
+		return nil, err
+	}
+	for i := range items {
+		items[i] = normalizeProjectItem(items[i], viewer, statusField)
+		if statusField != "" {
+			items[i].BoardStatus = items[i].FieldValues[statusField]
+		}
+	}
+	return items, nil
+}
+
 func normalizeProjectItem(item domain.ProjectItem, viewer, statusField string) domain.ProjectItem {
 	out := item
 	out.AssignedToMe = slices.Contains(item.Assignees, viewer)
@@ -1861,7 +1881,7 @@ func yesNo(v bool) string {
 func runDoctor(ctx context.Context, res auth.Result) (doctorReport, error) {
 	report := doctorReport{TokenSource: string(res.Source)}
 	if res.Token == "" {
-		report.Warning = "no GitHub token found; run any ferret command to authenticate"
+		report.Warning = "no GitHub token found; run `ferret init` or `ferret auth login`, or set GITHUB_TOKEN"
 		return report, fmt.Errorf("no GitHub token configured")
 	}
 	login, scopes, err := checkGitHubToken(ctx, res.Token)
@@ -1873,10 +1893,21 @@ func runDoctor(ctx context.Context, res auth.Result) (doctorReport, error) {
 	report.Login = login
 	report.RepoScope = contains(scopes, "repo")
 	report.ProjectScope = contains(scopes, "project")
-	if !report.ProjectScope {
-		report.Warning = "project scope not available; add it at https://github.com/settings/tokens"
-	}
+	report.Warning = doctorScopeHint(report.RepoScope, report.ProjectScope)
 	return report, nil
+}
+
+func doctorScopeHint(repoScope, projectScope bool) string {
+	switch {
+	case !repoScope && !projectScope:
+		return "token is missing both repo and project scopes; add `repo`, `read:org`, and `project` at https://github.com/settings/tokens"
+	case !repoScope:
+		return "repo scope not available; add `repo` and `read:org` at https://github.com/settings/tokens"
+	case !projectScope:
+		return "project scope not available; repo mode will work, but add `project` at https://github.com/settings/tokens for GitHub Projects support"
+	default:
+		return ""
+	}
 }
 
 // checkGitHubToken calls GET /user with the token and returns the login and
@@ -2450,9 +2481,19 @@ func defaultCatchUpBudget() catchUpBudget {
 	}
 }
 
-func prioritizePRsForReviewFetch(prs []domain.PRSnapshot, notifications []domain.NotificationThread, viewer string) []domain.PRSnapshot {
+func resolveCatchUpExpandOrder(cfg *config.Config, override string) (string, error) {
+	if override != "" {
+		return config.NormalizeCatchUpExpandOrder(override)
+	}
+	return config.NormalizeCatchUpExpandOrder(cfg.Defaults.CatchUp.ExpandOrder)
+}
+
+func prioritizePRsForReviewFetch(prs []domain.PRSnapshot, notifications []domain.NotificationThread, viewer, expandOrder string) []domain.PRSnapshot {
 	if len(prs) == 0 {
 		return nil
+	}
+	if expandOrder == "recency" {
+		return prioritizePRsByRecency(prs)
 	}
 	notificationReasonsByPR := map[int][]string{}
 	for _, thread := range notifications {
@@ -2468,6 +2509,20 @@ func prioritizePRsForReviewFetch(prs []domain.PRSnapshot, notifications []domain
 		if scoreA != scoreB {
 			return scoreB - scoreA
 		}
+		if !a.UpdatedAt.Equal(b.UpdatedAt) {
+			if a.UpdatedAt.After(b.UpdatedAt) {
+				return -1
+			}
+			return 1
+		}
+		return b.Number - a.Number
+	})
+	return prioritized
+}
+
+func prioritizePRsByRecency(prs []domain.PRSnapshot) []domain.PRSnapshot {
+	prioritized := append([]domain.PRSnapshot(nil), prs...)
+	slices.SortStableFunc(prioritized, func(a, b domain.PRSnapshot) int {
 		if !a.UpdatedAt.Equal(b.UpdatedAt) {
 			if a.UpdatedAt.After(b.UpdatedAt) {
 				return -1
@@ -2589,7 +2644,7 @@ func collectPRReviewActivityWithBudget(ctx context.Context, app app, owner, repo
 	return events, warnings
 }
 
-func collectCatchUpForRepo(ctx context.Context, app app, owner, repo, since, viewer string, me, closedOnly, openOnly, commentsOnly, reviewOnly bool, progress io.Writer) ([]domain.CatchUpEntry, []string) {
+func collectCatchUpForRepo(ctx context.Context, app app, owner, repo, since, viewer string, me, closedOnly, openOnly, commentsOnly, reviewOnly bool, expandOrder string, progress io.Writer) ([]domain.CatchUpEntry, []string) {
 	data := fetchCatchUpRepoData(ctx, app, owner, repo, since, progress)
 	warnings := append([]string(nil), data.warnings...)
 	budget := defaultCatchUpBudget()
@@ -2602,7 +2657,7 @@ func collectCatchUpForRepo(ctx context.Context, app app, owner, repo, since, vie
 	reviewComments := data.reviewComments
 	notifications := data.notifications
 	progressf(progress, "  reviews %s/%s", owner, repo)
-	reviewPRs := prioritizePRsForReviewFetch(prs, notifications, viewer)
+	reviewPRs := prioritizePRsForReviewFetch(prs, notifications, viewer, expandOrder)
 	reviews, reviewWarnings := collectPRReviewActivityWithBudget(ctx, app, owner, repo, since, reviewPRs, budget)
 	warnings = append(warnings, reviewWarnings...)
 	index := map[string]*domain.CatchUpEntry{}
@@ -3030,7 +3085,7 @@ func fetchActivityRepoData(ctx context.Context, app app, owner, repo, since stri
 	return data
 }
 
-func buildAllReposCatchUpReport(ctx context.Context, app app, cfg *config.Config, since, viewer string, me, closedOnly, openOnly, commentsOnly, reviewOnly bool, progress io.Writer) (domain.CatchUpReport, error) {
+func buildAllReposCatchUpReport(ctx context.Context, app app, cfg *config.Config, since, viewer string, me, closedOnly, openOnly, commentsOnly, reviewOnly bool, expandOrder string, progress io.Writer) (domain.CatchUpReport, error) {
 	repos, err := allWatchedRepos(cfg)
 	if err != nil {
 		return domain.CatchUpReport{}, err
@@ -3056,7 +3111,7 @@ func buildAllReposCatchUpReport(ctx context.Context, app app, cfg *config.Config
 			sem <- struct{}{}
 			defer func() { <-sem }()
 			progressf(progress, "fetching repo %s/%s", repo.Owner, repo.Name)
-			entries, warnings := collectCatchUpForRepo(ctx, app, repo.Owner, repo.Name, since, viewer, me, closedOnly, openOnly, commentsOnly, reviewOnly, progress)
+			entries, warnings := collectCatchUpForRepo(ctx, app, repo.Owner, repo.Name, since, viewer, me, closedOnly, openOnly, commentsOnly, reviewOnly, expandOrder, progress)
 			results[i] = repoResult{entries: entries, warnings: warnings}
 		}()
 	}

@@ -127,12 +127,12 @@ func Resolve(ctx context.Context, w io.Writer, r io.Reader) (Result, error) {
 
 	// 2. GITHUB_TOKEN env var.
 	if envToken := os.Getenv("GITHUB_TOKEN"); envToken != "" {
-		if !interactive || confirm(w, scanner, "Found GITHUB_TOKEN in environment. Use it for Ferret?") {
+		if !interactive || confirm(w, scanner, "Found GITHUB_TOKEN in environment. Use it for Ferret and save it for future runs?") {
 			if err := Save(envToken, SourceEnv); err != nil {
 				return Result{}, fmt.Errorf("save token: %w", err)
 			}
 			if interactive {
-				fmt.Fprintln(w, "Token saved to ~/.ferret/auth.yaml")
+				fmt.Fprintln(w, "Token saved to ~/.ferret/auth.yaml for future runs")
 			}
 			return Result{Token: envToken, Source: SourceEnv}, nil
 		}
@@ -140,12 +140,12 @@ func Resolve(ctx context.Context, w io.Writer, r io.Reader) (Result, error) {
 
 	// 3. gh auth token (only if gh is installed).
 	if token, err := ghToken(ctx); err == nil && token != "" {
-		if !interactive || confirm(w, scanner, "Found a token from the GitHub CLI (gh). Use it for Ferret?") {
+		if !interactive || confirm(w, scanner, "Found a token from the GitHub CLI (gh). Use it for Ferret and save it for future runs?") {
 			if err := Save(token, SourceGH); err != nil {
 				return Result{}, fmt.Errorf("save token: %w", err)
 			}
 			if interactive {
-				fmt.Fprintln(w, "Token saved to ~/.ferret/auth.yaml")
+				fmt.Fprintln(w, "Token saved to ~/.ferret/auth.yaml for future runs")
 			}
 			return Result{Token: token, Source: SourceGH}, nil
 		}
@@ -190,6 +190,7 @@ func promptPAT(w io.Writer, scanner *bufio.Scanner) (Result, error) {
 	fmt.Fprintln(w, "Create a Personal Access Token at: https://github.com/settings/tokens")
 	fmt.Fprintln(w, "Required scopes: repo, read:org")
 	fmt.Fprintln(w, "Add the project scope for GitHub Projects support.")
+	fmt.Fprintln(w, "Ferret will save it to ~/.ferret/auth.yaml and use it silently next time.")
 	fmt.Fprintln(w, "")
 	fmt.Fprint(w, "Enter token: ")
 	if !scanner.Scan() {
@@ -202,7 +203,7 @@ func promptPAT(w io.Writer, scanner *bufio.Scanner) (Result, error) {
 	if err := Save(token, SourcePAT); err != nil {
 		return Result{}, fmt.Errorf("save token: %w", err)
 	}
-	fmt.Fprintln(w, "Token saved to ~/.ferret/auth.yaml")
+	fmt.Fprintln(w, "Token saved to ~/.ferret/auth.yaml for future runs")
 	return Result{Token: token, Source: SourcePAT}, nil
 }
 

@@ -6,11 +6,9 @@ builds:
   - id: ferret
     main: ./cmd/ferret
     binary: ferret
-    env:
-      - CGO_ENABLED=0
     goos:
-      - linux
       - darwin
+      - linux
       - windows
     goarch:
       - amd64
@@ -18,29 +16,27 @@ builds:
     ignore:
       - goos: windows
         goarch: arm64
-    ldflags:
-      - -s -w
 
 archives:
-  - id: ferret
+  - id: default
     ids:
       - ferret
-    name_template: "{{ .ProjectName }}_{{ .Os }}_{{ .Arch }}"
+    formats:
+      - tar.gz
     format_overrides:
       - goos: windows
         formats:
           - zip
-    files:
-      - README.md
-      - LICENSE
+    name_template: >-
+      {{ .ProjectName }}_{{ .Os }}_{{ .Arch }}
 
 checksum:
-  name_template: "checksums.txt"
+  name_template: checksums.txt
 
 changelog:
   sort: asc
   filters:
     exclude:
       - "^docs:"
-      - "^test:"
       - "^chore:"
+      - "^test:"

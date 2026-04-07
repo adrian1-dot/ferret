@@ -11,9 +11,32 @@ Each command answers one question:
 
 It is designed to shrink the amount of GitHub data you need to hand to AI.
 
+## Install
+
+Recommended:
+
+1. Download the archive for your platform from the latest GitHub release.
+2. Extract it.
+3. Put the `ferret` binary somewhere on your `PATH`.
+
+Fallback:
+
+```bash
+go install github.com/adrian1-dot/ferret/cmd/ferret@latest
+```
+
+Current release artifacts are published for:
+- `darwin/amd64`
+- `darwin/arm64`
+- `linux/amd64`
+- `linux/arm64`
+- `windows/amd64`
+
+Homebrew is not a supported install path today.
+
 ## First Use
 
-Build it:
+If you installed from source instead of a release binary, build it with:
 
 ```bash
 go build ./cmd/ferret
@@ -65,8 +88,8 @@ Add a GitHub Project later if you want board-aware summaries:
 - **watched item**: a single issue or PR tracked by alias; it can be targeted directly in `inspect`, `activity`, and `catch-up`
 - `catch-up`: changed items only, good for daily review; cursor-backed so it picks up where it left off
 - `activity`: raw chronological events in the scope; cursor-backed
-- `manager`: broad factual snapshot — issues, PRs, review status, workflow runs; in project mode with `status_field` configured, board counts are rendered as `board_*`
-- `next`: open work grouped by action readiness, not a board-ground-truth report
+- `manager`: broad factual snapshot — issues, PRs, review status, workflow runs; in project mode with `status_field` configured, board counts are rendered as `board_*`, and the board item set is always a current snapshot
+- `next`: open work grouped by action readiness, not a board-ground-truth report; in project mode the board item set is still a current snapshot
 
 ## Requirements
 
@@ -83,9 +106,9 @@ Token resolution order:
 
 GitHub API rate limits apply; very large scopes or deep time windows may produce partial results.
 
-Run `ferret doctor` to verify your local setup.
+Run `ferret doctor` to verify your local setup, active token source, and available scopes.
 
-Pre-built release packaging is configured in this repo via GitHub Actions and Goreleaser.
+Pre-built releases are published through GitHub Actions and Goreleaser.
 
 ## Recommended Workflow
 
@@ -139,6 +162,14 @@ By default, Ferret only writes inside repo-local `.ferret/` roots:
 
 Use `--allow-outside-workspace` only when you intentionally want config or output paths outside those roots.
 
+Example catch-up defaults:
+
+```yaml
+defaults:
+  catch_up:
+    expand_order: balanced
+```
+
 ## Commands
 
 Setup:
@@ -189,6 +220,7 @@ Daily use:
 
 ```bash
 ferret catch-up my-repo --me
+ferret catch-up my-repo --expand-order recency
 ferret activity my-repo
 ferret manager my-repo
 ferret next my-repo
@@ -255,7 +287,8 @@ Ferret makes one or more GitHub API calls per command. For `catch-up`:
 - Open PR count still affects how much review-related work is in scope
 - Review expansion is capped to a safe default budget; when truncated, Ferret emits an explicit warning
 - That budget only affects deep review-thread expansion, not the base issue/PR facts returned by the command
-- When the budget is hit, Ferret expands PRs using already-fetched GitHub signals such as review requests, notifications, direct involvement, and recency
+- The default expansion order is `balanced`, which uses already-fetched GitHub signals such as review requests, notifications, direct involvement, and recency
+- Use `--expand-order recency` or set `defaults.catch_up.expand_order: recency` to prefer a more neutral updated-time order
 - Rate-limit errors from GitHub surface as partial-report warnings — the command
   does not crash; results up to the limit are still returned
 - Preview recovery is also budgeted and warns when deeper recovery is skipped

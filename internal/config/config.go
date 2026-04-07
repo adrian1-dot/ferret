@@ -14,9 +14,10 @@ import (
 )
 
 const (
-	DefaultConfigPath = ".ferret/config.yaml"
-	DefaultOutputDir  = ".ferret"
-	DefaultPlanDir    = ".ferret/plans"
+	DefaultConfigPath         = ".ferret/config.yaml"
+	DefaultOutputDir          = ".ferret"
+	DefaultPlanDir            = ".ferret/plans"
+	DefaultCatchUpExpandOrder = "balanced"
 )
 
 type Config struct {
@@ -26,15 +27,20 @@ type Config struct {
 }
 
 type Defaults struct {
-	Host      string      `yaml:"host" json:"host"`
-	OutputDir string      `yaml:"output_dir" json:"output_dir"`
-	PlanDir   string      `yaml:"plan_dir" json:"plan_dir"`
-	Cache     CacheConfig `yaml:"cache" json:"cache"`
+	Host      string          `yaml:"host" json:"host"`
+	OutputDir string          `yaml:"output_dir" json:"output_dir"`
+	PlanDir   string          `yaml:"plan_dir" json:"plan_dir"`
+	Cache     CacheConfig     `yaml:"cache" json:"cache"`
+	CatchUp   CatchUpDefaults `yaml:"catch_up" json:"catch_up"`
 }
 
 type CacheConfig struct {
 	Enabled bool   `yaml:"enabled" json:"enabled"`
 	TTL     string `yaml:"ttl" json:"ttl"`
+}
+
+type CatchUpDefaults struct {
+	ExpandOrder string `yaml:"expand_order,omitempty" json:"expand_order,omitempty"`
 }
 
 type Watch struct {
@@ -98,6 +104,9 @@ func Default() *Config {
 			Cache: CacheConfig{
 				Enabled: true,
 				TTL:     "15m",
+			},
+			CatchUp: CatchUpDefaults{
+				ExpandOrder: DefaultCatchUpExpandOrder,
 			},
 		},
 	}
@@ -183,6 +192,9 @@ func Validate(cfg *Config) error {
 	if err := validateOutputPath("defaults.plan_dir", cfg.Defaults.PlanDir); err != nil {
 		return err
 	}
+	if _, err := NormalizeCatchUpExpandOrder(cfg.Defaults.CatchUp.ExpandOrder); err != nil {
+		return fmt.Errorf("defaults.catch_up.expand_order: %w", err)
+	}
 	aliases := map[string]string{}
 	for _, r := range cfg.Watch.Repos {
 		if r.Alias == "" || r.Owner == "" || r.Name == "" {
@@ -251,6 +263,17 @@ func hasRepoAlias(cfg *Config, alias string) bool {
 		}
 	}
 	return false
+}
+
+func NormalizeCatchUpExpandOrder(order string) (string, error) {
+	switch strings.ToLower(strings.TrimSpace(order)) {
+	case "", DefaultCatchUpExpandOrder:
+		return DefaultCatchUpExpandOrder, nil
+	case "recency":
+		return "recency", nil
+	default:
+		return "", fmt.Errorf("unsupported value %q (expected balanced or recency)", order)
+	}
 }
 
 func hasProjectAlias(cfg *Config, alias string) bool {
