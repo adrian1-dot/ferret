@@ -192,14 +192,15 @@ type WatchedItemEntry struct {
 }
 
 type CatchUpReport struct {
-	GeneratedAt  time.Time          `json:"generated_at"`
-	Target       string             `json:"target"`
-	TargetKind   string             `json:"target_kind"`
-	Since        string             `json:"since"`
-	Partial      bool               `json:"partial"`
-	Warnings     []string           `json:"warnings,omitempty"`
-	Entries      []CatchUpEntry     `json:"entries"`
-	WatchedItems []WatchedItemEntry `json:"watched_items,omitempty"`
+	GeneratedAt        time.Time          `json:"generated_at"`
+	Target             string             `json:"target"`
+	TargetKind         string             `json:"target_kind"`
+	Since              string             `json:"since"`
+	Partial            bool               `json:"partial"`
+	DiagnosticsSummary []string           `json:"diagnostics_summary,omitempty"`
+	Warnings           []string           `json:"warnings,omitempty"`
+	Entries            []CatchUpEntry     `json:"entries"`
+	WatchedItems       []WatchedItemEntry `json:"watched_items,omitempty"`
 }
 
 type ActivityEntry struct {

@@ -40,7 +40,8 @@ type CacheConfig struct {
 }
 
 type CatchUpDefaults struct {
-	ExpandOrder string `yaml:"expand_order,omitempty" json:"expand_order,omitempty"`
+	ExpandOrder  string `yaml:"expand_order,omitempty" json:"expand_order,omitempty"`
+	ReviewBudget int    `yaml:"review_budget,omitempty" json:"review_budget,omitempty"`
 }
 
 type Watch struct {
@@ -194,6 +195,9 @@ func Validate(cfg *Config) error {
 	}
 	if _, err := NormalizeCatchUpExpandOrder(cfg.Defaults.CatchUp.ExpandOrder); err != nil {
 		return fmt.Errorf("defaults.catch_up.expand_order: %w", err)
+	}
+	if cfg.Defaults.CatchUp.ReviewBudget < 0 {
+		return fmt.Errorf("defaults.catch_up.review_budget: unsupported value %d (expected 0 or greater)", cfg.Defaults.CatchUp.ReviewBudget)
 	}
 	aliases := map[string]string{}
 	for _, r := range cfg.Watch.Repos {

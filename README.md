@@ -168,7 +168,12 @@ Example catch-up defaults:
 defaults:
   catch_up:
     expand_order: balanced
+    review_budget: 10
 ```
+
+`defaults.catch_up.review_budget` sets the default number of PRs that receive deep
+review-thread expansion. `0` keeps the built-in default budget. The CLI flag
+`--review-budget` overrides the config value for a single run.
 
 ## Commands
 

@@ -142,6 +142,37 @@ func TestTextRendererRenderCatchUpGroupsEntries(t *testing.T) {
 	}
 }
 
+func TestTextRendererRenderCatchUpShowsDiagnosticsSummaryWithoutWarnings(t *testing.T) {
+	t.Parallel()
+
+	report := domain.CatchUpReport{
+		GeneratedAt: time.Date(2026, 3, 28, 12, 0, 0, 0, time.UTC),
+		Target:      "api",
+		TargetKind:  "repo",
+		Since:       "2026-03-21T00:00:00Z",
+		Partial:     true,
+		DiagnosticsSummary: []string{
+			"review expansion truncated",
+			"issue comments rate-limited",
+		},
+		Entries: []domain.CatchUpEntry{
+			{Repo: "api", Number: 1, Title: "Commented", LatestEvent: "commented", LatestActor: "alice"},
+		},
+	}
+
+	var buf bytes.Buffer
+	if err := (TextRenderer{}).RenderCatchUp(&buf, report); err != nil {
+		t.Fatal(err)
+	}
+	out := buf.String()
+	if !strings.Contains(out, "Diagnostics: review expansion truncated; issue comments rate-limited") {
+		t.Fatalf("expected diagnostics summary, got %q", out)
+	}
+	if strings.Contains(out, "\nWarnings:\n") {
+		t.Fatalf("expected no warnings section without detailed diagnostics, got %q", out)
+	}
+}
+
 func TestTextRendererRenderNextShowsSectionCountsAndMetadata(t *testing.T) {
 	t.Parallel()
 	report := domain.NextReport{

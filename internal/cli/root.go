@@ -908,6 +908,8 @@ func newCatchUpCmd(opts *rootOptions) *cobra.Command {
 	var commentsOnly bool
 	var reviewOnly bool
 	var expandOrder string
+	var reviewBudget int
+	var diagnostics bool
 	var out string
 	var all bool
 	cmd := &cobra.Command{
@@ -945,11 +947,15 @@ best partial result it has. The budget only affects deep review-thread
 expansion, not the base issue and pull-request facts in scope. Under
 truncation, Ferret defaults to a balanced expansion order based on already-
 fetched GitHub signals. Use --expand-order recency for a more neutral mode.
+Use --review-budget to control how many PRs receive deep review-thread fetches.
+Set defaults.catch_up.review_budget to make that budget persistent.
+Use --diagnostics to print the full detailed warning list when a run is partial.
 
 Examples:
 
   ferret catch-up my-repo --me
   ferret catch-up my-repo --expand-order recency
+  ferret catch-up my-repo --review-budget 10
   ferret catch-up --since 7d
   ferret catch-up --all --me --out .ferret/catchup.md`,
 		Args: cobra.MaximumNArgs(1),
@@ -990,13 +996,17 @@ Examples:
 			if err != nil {
 				return err
 			}
+			resolvedBudget, err := resolveCatchUpBudget(cfg, reviewBudget)
+			if err != nil {
+				return err
+			}
 			effectiveSince, usedCursor, err := resolveStatefulSince(ctx, app.state, "catch-up", defaultCursorScope(all, ref), since, defaultSinceForAlias(cfg, ref), "24h")
 			if err != nil {
 				return err
 			}
 			var report domain.CatchUpReport
 			if all {
-				report, err = buildAllReposCatchUpReport(ctx, app, cfg, effectiveSince, viewer, me, closedOnly, openOnly, commentsOnly, reviewOnly, resolvedExpandOrder, cmd.ErrOrStderr())
+				report, err = buildAllReposCatchUpReport(ctx, app, cfg, effectiveSince, viewer, me, closedOnly, openOnly, commentsOnly, reviewOnly, resolvedExpandOrder, resolvedBudget, cmd.ErrOrStderr())
 				if err != nil {
 					return err
 				}
@@ -1037,7 +1047,7 @@ Examples:
 						sem <- struct{}{}
 						defer func() { <-sem }()
 						progressf(cmd.ErrOrStderr(), "fetching repo %s/%s", repo.Owner, repo.Name)
-						entries, warnings := collectCatchUpForRepo(ctx, app, repo.Owner, repo.Name, effectiveSince, viewer, me, closedOnly, openOnly, commentsOnly, reviewOnly, resolvedExpandOrder, cmd.ErrOrStderr())
+						entries, warnings := collectCatchUpForRepo(ctx, app, repo.Owner, repo.Name, effectiveSince, viewer, me, closedOnly, openOnly, commentsOnly, reviewOnly, resolvedExpandOrder, resolvedBudget, cmd.ErrOrStderr())
 						results[i] = repoResult{entries: entries, warnings: warnings}
 					}()
 				}
@@ -1076,7 +1086,7 @@ Examples:
 					TargetKind:  "repo",
 					Since:       effectiveSince,
 				}
-				entries, warnings := collectCatchUpForRepo(ctx, app, repo.Owner, repo.Name, effectiveSince, viewer, me, closedOnly, openOnly, commentsOnly, reviewOnly, resolvedExpandOrder, cmd.ErrOrStderr())
+				entries, warnings := collectCatchUpForRepo(ctx, app, repo.Owner, repo.Name, effectiveSince, viewer, me, closedOnly, openOnly, commentsOnly, reviewOnly, resolvedExpandOrder, resolvedBudget, cmd.ErrOrStderr())
 				report.Entries = entries
 				if len(warnings) > 0 {
 					report.Partial = true
@@ -1099,6 +1109,7 @@ Examples:
 				}
 			}
 			sortCatchUpEntries(report.Entries)
+			finalizeCatchUpDiagnostics(&report, diagnostics)
 			if err := renderToOutput(out, cmd.OutOrStdout(), opts.allowOutsideWorkspace, func(w io.Writer) error {
 				return app.renderer.RenderCatchUp(w, report)
 			}); err != nil {
@@ -1117,6 +1128,8 @@ Examples:
 	cmd.Flags().BoolVar(&commentsOnly, "comments-only", false, "show only comment and review activity")
 	cmd.Flags().BoolVar(&reviewOnly, "review-only", false, "show only items where a review was requested")
 	cmd.Flags().StringVar(&expandOrder, "expand-order", "", "deep review expansion order: balanced or recency")
+	cmd.Flags().IntVar(&reviewBudget, "review-budget", 0, "max PRs to expand for deep review-thread fetches (0 uses the default budget)")
+	cmd.Flags().BoolVar(&diagnostics, "diagnostics", false, "show the full detailed warning list when catch-up is partial")
 	cmd.Flags().StringVar(&out, "out", "", "write output to file under .ferret/ by default (default format: markdown)")
 	cmd.Flags().BoolVar(&all, "all", false, "run across all watched repos")
 	return cmd
@@ -2481,6 +2494,22 @@ func defaultCatchUpBudget() catchUpBudget {
 	}
 }
 
+func resolveCatchUpBudget(cfg *config.Config, override int) (catchUpBudget, error) {
+	budget := defaultCatchUpBudget()
+	switch {
+	case override < 0:
+		return catchUpBudget{}, fmt.Errorf("invalid --review-budget %d (expected 0 or greater)", override)
+	case override > 0:
+		budget.MaxPRReviewFetches = override
+		return budget, nil
+	case cfg != nil && cfg.Defaults.CatchUp.ReviewBudget > 0:
+		budget.MaxPRReviewFetches = cfg.Defaults.CatchUp.ReviewBudget
+		return budget, nil
+	default:
+		return budget, nil
+	}
+}
+
 func resolveCatchUpExpandOrder(cfg *config.Config, override string) (string, error) {
 	if override != "" {
 		return config.NormalizeCatchUpExpandOrder(override)
@@ -2574,8 +2603,11 @@ func reviewFetchPriorityScore(pr domain.PRSnapshot, notificationReasons []string
 }
 
 func boundedPRsForReviewFetch(prs []domain.PRSnapshot, max int) ([]domain.PRSnapshot, bool) {
-	if max <= 0 || len(prs) <= max {
+	if max < 0 || len(prs) <= max {
 		return prs, false
+	}
+	if max == 0 {
+		return nil, len(prs) > 0
 	}
 	return prs[:max], true
 }
@@ -2604,7 +2636,7 @@ func collectPRReviewActivityWithBudget(ctx context.Context, app app, owner, repo
 	limitedPRs, truncated := boundedPRsForReviewFetch(prs, budget.MaxPRReviewFetches)
 	var warnings []string
 	if truncated {
-		warnings = append(warnings, fmt.Sprintf("review fetch budget hit for %s/%s: expanded %d of %d PRs", owner, repo, len(limitedPRs), len(prs)))
+		warnings = append(warnings, reviewExpansionBudgetWarning(owner, repo, len(limitedPRs), len(prs)))
 	}
 	type reviewResult struct {
 		events  []domain.ActivityEvent
@@ -2644,14 +2676,13 @@ func collectPRReviewActivityWithBudget(ctx context.Context, app app, owner, repo
 	return events, warnings
 }
 
-func collectCatchUpForRepo(ctx context.Context, app app, owner, repo, since, viewer string, me, closedOnly, openOnly, commentsOnly, reviewOnly bool, expandOrder string, progress io.Writer) ([]domain.CatchUpEntry, []string) {
+func collectCatchUpForRepo(ctx context.Context, app app, owner, repo, since, viewer string, me, closedOnly, openOnly, commentsOnly, reviewOnly bool, expandOrder string, budget catchUpBudget, progress io.Writer) ([]domain.CatchUpEntry, []string) {
 	data := fetchCatchUpRepoData(ctx, app, owner, repo, since, progress)
 	warnings := append([]string(nil), data.warnings...)
-	budget := defaultCatchUpBudget()
 	issues := data.issues
 	prs := data.prs
 	if len(prs) > 20 {
-		progressf(progress, "  warning: %d PRs in scope for %s/%s — review fetches scale with PR count and may approach GitHub rate limits", len(prs), owner, repo)
+		progressf(progress, "  warning: %d PRs in scope for %s/%s — base catch-up entries stay factual; expanding review threads scales with PR count and may approach GitHub rate limits", len(prs), owner, repo)
 	}
 	issueComments := data.issueComments
 	reviewComments := data.reviewComments
@@ -2813,7 +2844,7 @@ func fetchCatchUpRepoData(ctx context.Context, app app, owner, repo, since strin
 		defer mu.Unlock()
 		if err != nil {
 			if github.IsKind(err, github.ErrRateLimited) {
-				data.warnings = append(data.warnings, fmt.Sprintf("rate-limited fetching issues for %s/%s (partial results)", owner, repo))
+				data.warnings = append(data.warnings, repoRateLimitWarning("issues", owner, repo, "issue snapshots may be incomplete"))
 			} else {
 				data.warnings = append(data.warnings, fmt.Sprintf("issues for %s/%s: %v", owner, repo, err))
 			}
@@ -2828,7 +2859,7 @@ func fetchCatchUpRepoData(ctx context.Context, app app, owner, repo, since strin
 		defer mu.Unlock()
 		if err != nil {
 			if github.IsKind(err, github.ErrRateLimited) {
-				data.warnings = append(data.warnings, fmt.Sprintf("rate-limited fetching prs for %s/%s (partial results)", owner, repo))
+				data.warnings = append(data.warnings, repoRateLimitWarning("prs", owner, repo, "PR snapshots may be incomplete"))
 			} else {
 				data.warnings = append(data.warnings, fmt.Sprintf("prs for %s/%s: %v", owner, repo, err))
 			}
@@ -2843,7 +2874,7 @@ func fetchCatchUpRepoData(ctx context.Context, app app, owner, repo, since strin
 		defer mu.Unlock()
 		if err != nil {
 			if github.IsKind(err, github.ErrRateLimited) {
-				data.warnings = append(data.warnings, fmt.Sprintf("rate-limited fetching issue comments for %s/%s (partial results)", owner, repo))
+				data.warnings = append(data.warnings, repoRateLimitWarning("issue comments", owner, repo, "some issue-thread discussion may be omitted"))
 			} else {
 				data.warnings = append(data.warnings, fmt.Sprintf("issue comments for %s/%s: %v", owner, repo, err))
 			}
@@ -2858,7 +2889,7 @@ func fetchCatchUpRepoData(ctx context.Context, app app, owner, repo, since strin
 		defer mu.Unlock()
 		if err != nil {
 			if github.IsKind(err, github.ErrRateLimited) {
-				data.warnings = append(data.warnings, fmt.Sprintf("rate-limited fetching review comments for %s/%s (partial results)", owner, repo))
+				data.warnings = append(data.warnings, repoRateLimitWarning("review comments", owner, repo, "some PR-thread discussion may be omitted"))
 			} else {
 				data.warnings = append(data.warnings, fmt.Sprintf("review comments for %s/%s: %v", owner, repo, err))
 			}
@@ -2872,7 +2903,11 @@ func fetchCatchUpRepoData(ctx context.Context, app app, owner, repo, since strin
 		mu.Lock()
 		defer mu.Unlock()
 		if err != nil {
-			data.warnings = append(data.warnings, fmt.Sprintf("notifications for %s/%s: %v", owner, repo, err))
+			if github.IsKind(err, github.ErrRateLimited) {
+				data.warnings = append(data.warnings, repoRateLimitWarning("notifications", owner, repo, "notification-driven involvement may be incomplete"))
+			} else {
+				data.warnings = append(data.warnings, fmt.Sprintf("notifications for %s/%s: %v", owner, repo, err))
+			}
 			return
 		}
 		data.notifications = threads
@@ -2960,7 +2995,7 @@ func collectActivityForRepo(ctx context.Context, app app, owner, repo, since str
 	issueComments := data.issueComments
 	reviewComments := data.reviewComments
 	progressf(progress, "  reviews %s/%s", owner, repo)
-	reviews, reviewWarnings := collectPRReviewActivityWithBudget(ctx, app, owner, repo, since, prs, catchUpBudget{})
+	reviews, reviewWarnings := collectPRReviewActivityWithBudget(ctx, app, owner, repo, since, prs, catchUpBudget{MaxPRReviewFetches: -1})
 	warnings = append(warnings, reviewWarnings...)
 	var entries []domain.ActivityEntry
 	for _, issue := range issues {
@@ -3085,7 +3120,7 @@ func fetchActivityRepoData(ctx context.Context, app app, owner, repo, since stri
 	return data
 }
 
-func buildAllReposCatchUpReport(ctx context.Context, app app, cfg *config.Config, since, viewer string, me, closedOnly, openOnly, commentsOnly, reviewOnly bool, expandOrder string, progress io.Writer) (domain.CatchUpReport, error) {
+func buildAllReposCatchUpReport(ctx context.Context, app app, cfg *config.Config, since, viewer string, me, closedOnly, openOnly, commentsOnly, reviewOnly bool, expandOrder string, budget catchUpBudget, progress io.Writer) (domain.CatchUpReport, error) {
 	repos, err := allWatchedRepos(cfg)
 	if err != nil {
 		return domain.CatchUpReport{}, err
@@ -3111,7 +3146,7 @@ func buildAllReposCatchUpReport(ctx context.Context, app app, cfg *config.Config
 			sem <- struct{}{}
 			defer func() { <-sem }()
 			progressf(progress, "fetching repo %s/%s", repo.Owner, repo.Name)
-			entries, warnings := collectCatchUpForRepo(ctx, app, repo.Owner, repo.Name, since, viewer, me, closedOnly, openOnly, commentsOnly, reviewOnly, expandOrder, progress)
+			entries, warnings := collectCatchUpForRepo(ctx, app, repo.Owner, repo.Name, since, viewer, me, closedOnly, openOnly, commentsOnly, reviewOnly, expandOrder, budget, progress)
 			results[i] = repoResult{entries: entries, warnings: warnings}
 		}()
 	}
@@ -3219,6 +3254,62 @@ func normalizeActivityEvent(event domain.ActivityEvent, issues []domain.IssueSna
 	return event, "", "", "", false
 }
 
+func repoRateLimitWarning(subject, owner, repo, omission string) string {
+	return fmt.Sprintf("%s for %s/%s: rate limited; base report stays factual, but %s", subject, owner, repo, omission)
+}
+
+func itemRateLimitWarning(subject, owner, repo string, number int, omission string) string {
+	return fmt.Sprintf("%s for %s/%s#%d: rate limited; item summary stays factual, but %s", subject, owner, repo, number, omission)
+}
+
+func reviewExpansionBudgetWarning(owner, repo string, expanded, total int) string {
+	return fmt.Sprintf("review expansion truncated for %s/%s: base catch-up entries remain factual; expanded review threads for %d of %d PRs", owner, repo, expanded, total)
+}
+
+func previewRecoveryBudgetWarning(owner, repo string, fetches int) string {
+	return fmt.Sprintf("preview recovery truncated for %s/%s after %d fetches: entries remain factual, but some notification-only previews could not be recovered", owner, repo, fetches)
+}
+
+func finalizeCatchUpDiagnostics(report *domain.CatchUpReport, includeDetails bool) {
+	if len(report.Warnings) == 0 {
+		return
+	}
+	report.DiagnosticsSummary = summarizeCatchUpDiagnostics(report.Warnings)
+	if !includeDetails {
+		report.Warnings = nil
+	}
+}
+
+func summarizeCatchUpDiagnostics(warnings []string) []string {
+	var out []string
+	seen := map[string]struct{}{}
+	appendSummary := func(value string) {
+		if value == "" {
+			return
+		}
+		if _, ok := seen[value]; ok {
+			return
+		}
+		seen[value] = struct{}{}
+		out = append(out, value)
+	}
+	for _, warning := range warnings {
+		switch {
+		case strings.HasPrefix(warning, "review expansion truncated for "):
+			appendSummary("review expansion truncated")
+		case strings.HasPrefix(warning, "preview recovery truncated for "):
+			appendSummary("preview recovery truncated")
+		case strings.Contains(warning, ": rate limited;"):
+			subject, _, _ := strings.Cut(warning, " for ")
+			appendSummary(subject + " rate-limited")
+		default:
+			summary, _, _ := strings.Cut(warning, ":")
+			appendSummary(summary)
+		}
+	}
+	return out
+}
+
 func sortActivityEntries(entries []domain.ActivityEntry) {
 	slices.SortFunc(entries, func(a, b domain.ActivityEntry) int {
 		if a.Repo != b.Repo {
@@ -3286,7 +3377,7 @@ func recoverNotificationPreviews(ctx context.Context, app app, owner, repo, sinc
 		_ = applyRecoveredPreview(entry, events, viewer, since)
 	}
 	if truncated {
-		warnings = append(warnings, fmt.Sprintf("preview recovery budget hit for %s/%s after %d fetches", owner, repo, fetches))
+		warnings = append(warnings, previewRecoveryBudgetWarning(owner, repo, fetches))
 	}
 	return warnings
 }
@@ -3488,7 +3579,7 @@ func collectWatchedItemEntry(ctx context.Context, app app, iw config.ItemWatch, 
 		issueComments, icerr := app.backend.ListIssueThreadComments(ctx, iw.Owner, iw.Repo, iw.Number)
 		if icerr != nil {
 			if github.IsKind(icerr, github.ErrRateLimited) {
-				warnings = append(warnings, fmt.Sprintf("rate-limited fetching pr issue comments for %s/%s#%d (partial)", iw.Owner, iw.Repo, iw.Number))
+				warnings = append(warnings, itemRateLimitWarning("pr issue comments", iw.Owner, iw.Repo, iw.Number, "some issue-thread discussion may be omitted"))
 			} else {
 				warnings = append(warnings, fmt.Sprintf("pr issue comments for %s/%s#%d: %v", iw.Owner, iw.Repo, iw.Number, icerr))
 			}
@@ -3496,7 +3587,7 @@ func collectWatchedItemEntry(ctx context.Context, app app, iw config.ItemWatch, 
 		comments, cerr := app.backend.ListPullRequestThreadComments(ctx, iw.Owner, iw.Repo, iw.Number)
 		if cerr != nil {
 			if github.IsKind(cerr, github.ErrRateLimited) {
-				warnings = append(warnings, fmt.Sprintf("rate-limited fetching pr comments for %s/%s#%d (partial)", iw.Owner, iw.Repo, iw.Number))
+				warnings = append(warnings, itemRateLimitWarning("pr comments", iw.Owner, iw.Repo, iw.Number, "some PR-thread discussion may be omitted"))
 			} else {
 				warnings = append(warnings, fmt.Sprintf("pr comments for %s/%s#%d: %v", iw.Owner, iw.Repo, iw.Number, cerr))
 			}
@@ -3504,7 +3595,7 @@ func collectWatchedItemEntry(ctx context.Context, app app, iw config.ItemWatch, 
 		reviews, rerr := app.backend.ListPullRequestThreadReviews(ctx, iw.Owner, iw.Repo, iw.Number)
 		if rerr != nil {
 			if github.IsKind(rerr, github.ErrRateLimited) {
-				warnings = append(warnings, fmt.Sprintf("rate-limited fetching pr reviews for %s/%s#%d (partial)", iw.Owner, iw.Repo, iw.Number))
+				warnings = append(warnings, itemRateLimitWarning("pr reviews", iw.Owner, iw.Repo, iw.Number, "some review-thread activity may be omitted"))
 			} else {
 				warnings = append(warnings, fmt.Sprintf("pr reviews for %s/%s#%d: %v", iw.Owner, iw.Repo, iw.Number, rerr))
 			}
@@ -3517,7 +3608,7 @@ func collectWatchedItemEntry(ctx context.Context, app app, iw config.ItemWatch, 
 		pr, perr := app.backend.GetPullRequest(ctx, iw.Owner, iw.Repo, iw.Number)
 		if perr != nil {
 			if github.IsKind(perr, github.ErrRateLimited) {
-				warnings = append(warnings, fmt.Sprintf("rate-limited fetching pr state for %s/%s#%d (partial)", iw.Owner, iw.Repo, iw.Number))
+				warnings = append(warnings, itemRateLimitWarning("pr state", iw.Owner, iw.Repo, iw.Number, "current PR state may be stale"))
 			} else {
 				warnings = append(warnings, fmt.Sprintf("pr state for %s/%s#%d: %v", iw.Owner, iw.Repo, iw.Number, perr))
 			}
@@ -3545,7 +3636,7 @@ func collectWatchedItemEntry(ctx context.Context, app app, iw config.ItemWatch, 
 		comments, cerr := app.backend.ListIssueThreadComments(ctx, iw.Owner, iw.Repo, iw.Number)
 		if cerr != nil {
 			if github.IsKind(cerr, github.ErrRateLimited) {
-				warnings = append(warnings, fmt.Sprintf("rate-limited fetching issue comments for %s/%s#%d (partial)", iw.Owner, iw.Repo, iw.Number))
+				warnings = append(warnings, itemRateLimitWarning("issue comments", iw.Owner, iw.Repo, iw.Number, "some issue-thread discussion may be omitted"))
 			} else {
 				warnings = append(warnings, fmt.Sprintf("issue comments for %s/%s#%d: %v", iw.Owner, iw.Repo, iw.Number, cerr))
 			}
@@ -3556,7 +3647,7 @@ func collectWatchedItemEntry(ctx context.Context, app app, iw config.ItemWatch, 
 		issue, ierr := app.backend.GetIssue(ctx, iw.Owner, iw.Repo, iw.Number)
 		if ierr != nil {
 			if github.IsKind(ierr, github.ErrRateLimited) {
-				warnings = append(warnings, fmt.Sprintf("rate-limited fetching issue state for %s/%s#%d (partial)", iw.Owner, iw.Repo, iw.Number))
+				warnings = append(warnings, itemRateLimitWarning("issue state", iw.Owner, iw.Repo, iw.Number, "current issue state may be stale"))
 			} else {
 				warnings = append(warnings, fmt.Sprintf("issue state for %s/%s#%d: %v", iw.Owner, iw.Repo, iw.Number, ierr))
 			}

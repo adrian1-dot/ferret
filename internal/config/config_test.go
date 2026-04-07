@@ -70,6 +70,21 @@ func TestValidateRejectsInvalidCatchUpExpandOrder(t *testing.T) {
 	}
 }
 
+func TestValidateRejectsNegativeCatchUpReviewBudget(t *testing.T) {
+	t.Parallel()
+
+	cfg := Default()
+	cfg.Defaults.CatchUp.ReviewBudget = -1
+
+	err := Validate(cfg)
+	if err == nil {
+		t.Fatal("expected error for negative catch-up review budget")
+	}
+	if !strings.Contains(err.Error(), "review_budget") {
+		t.Fatalf("expected error to name the field, got: %s", err.Error())
+	}
+}
+
 func TestNormalizeCatchUpExpandOrder(t *testing.T) {
 	t.Parallel()
 	cases := []struct {

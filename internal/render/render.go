@@ -116,6 +116,9 @@ func (TextRenderer) RenderCatchUp(w io.Writer, report domain.CatchUpReport) erro
 	if report.Partial {
 		fmt.Fprintln(w, "Partial: true")
 	}
+	if len(report.DiagnosticsSummary) > 0 {
+		fmt.Fprintf(w, "Diagnostics: %s\n", strings.Join(report.DiagnosticsSummary, "; "))
+	}
 	if len(report.Warnings) > 0 {
 		fmt.Fprintln(w, "\nWarnings:")
 		for _, warning := range report.Warnings {
@@ -357,6 +360,13 @@ func (MarkdownRenderer) RenderCatchUp(w io.Writer, report domain.CatchUpReport) 
 	fmt.Fprintf(w, "# %s\n\n", report.Target)
 	fmt.Fprintf(w, "Generated at: `%s`\n\n", report.GeneratedAt.Format("2006-01-02 15:04:05Z07:00"))
 	fmt.Fprintf(w, "Since: `%s`\n\n", report.Since)
+	if len(report.DiagnosticsSummary) > 0 {
+		fmt.Fprintln(w, "## Diagnostics")
+		for _, item := range report.DiagnosticsSummary {
+			fmt.Fprintf(w, "- %s\n", item)
+		}
+		fmt.Fprintln(w)
+	}
 	if len(report.Warnings) > 0 {
 		fmt.Fprintln(w, "## Warnings")
 		for _, warning := range report.Warnings {

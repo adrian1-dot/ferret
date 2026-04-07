@@ -7,6 +7,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -31,6 +32,16 @@ type fakeBackend struct {
 	lastProjectItemsQuery      github.ProjectItemsQuery
 	listRepoPRsCalls           int
 	listPullRequestReviewCalls int
+	listRepoIssuesErr          error
+	listRepoPRsErr             error
+	listIssueCommentsErr       error
+	listReviewCommentsErr      error
+	listRepoNotificationsErr   error
+	threadIssueCommentsErr     error
+	threadPRCommentsErr        error
+	threadPRReviewsErr         error
+	getIssueErr                error
+	getPRErr                   error
 }
 
 func (f *fakeBackend) GetViewer(context.Context) (string, error) {
@@ -42,6 +53,9 @@ func (f *fakeBackend) GetRepo(context.Context, string, string) (domain.RepoSnaps
 }
 
 func (f *fakeBackend) GetIssue(_ context.Context, _ string, _ string, number int) (domain.IssueSnapshot, error) {
+	if f.getIssueErr != nil {
+		return domain.IssueSnapshot{}, f.getIssueErr
+	}
 	for _, issue := range f.issues {
 		if issue.Number == number {
 			return issue, nil
@@ -51,6 +65,9 @@ func (f *fakeBackend) GetIssue(_ context.Context, _ string, _ string, number int
 }
 
 func (f *fakeBackend) GetPullRequest(_ context.Context, _ string, _ string, number int) (domain.PRSnapshot, error) {
+	if f.getPRErr != nil {
+		return domain.PRSnapshot{}, f.getPRErr
+	}
 	for _, pr := range f.prs {
 		if pr.Number == number {
 			return pr, nil
@@ -64,11 +81,17 @@ func (f *fakeBackend) ListUserRecentRepos(context.Context, int) ([]domain.RepoSn
 }
 
 func (f *fakeBackend) ListRepoIssues(context.Context, string, string, github.IssueQuery) ([]domain.IssueSnapshot, error) {
+	if f.listRepoIssuesErr != nil {
+		return nil, f.listRepoIssuesErr
+	}
 	return append([]domain.IssueSnapshot(nil), f.issues...), nil
 }
 
 func (f *fakeBackend) ListRepoPRs(context.Context, string, string, github.PRQuery) ([]domain.PRSnapshot, error) {
 	f.listRepoPRsCalls++
+	if f.listRepoPRsErr != nil {
+		return nil, f.listRepoPRsErr
+	}
 	return append([]domain.PRSnapshot(nil), f.prs...), nil
 }
 
@@ -77,10 +100,16 @@ func (f *fakeBackend) ListWorkflowRuns(context.Context, string, string, github.W
 }
 
 func (f *fakeBackend) ListIssueCommentActivity(context.Context, string, string, string) ([]domain.ActivityEvent, error) {
+	if f.listIssueCommentsErr != nil {
+		return nil, f.listIssueCommentsErr
+	}
 	return append([]domain.ActivityEvent(nil), f.issueComments...), nil
 }
 
 func (f *fakeBackend) ListPullRequestReviewCommentActivity(context.Context, string, string, string) ([]domain.ActivityEvent, error) {
+	if f.listReviewCommentsErr != nil {
+		return nil, f.listReviewCommentsErr
+	}
 	return append([]domain.ActivityEvent(nil), f.reviewComments...), nil
 }
 
@@ -90,18 +119,30 @@ func (f *fakeBackend) ListPullRequestReviewActivity(context.Context, string, str
 }
 
 func (f *fakeBackend) ListRepoNotifications(context.Context, string, string, string) ([]domain.NotificationThread, error) {
+	if f.listRepoNotificationsErr != nil {
+		return nil, f.listRepoNotificationsErr
+	}
 	return append([]domain.NotificationThread(nil), f.repoNotifications...), nil
 }
 
 func (f *fakeBackend) ListIssueThreadComments(_ context.Context, _ string, _ string, number int) ([]domain.ActivityEvent, error) {
+	if f.threadIssueCommentsErr != nil {
+		return nil, f.threadIssueCommentsErr
+	}
 	return append([]domain.ActivityEvent(nil), f.threadIssueCommentsByItem[number]...), nil
 }
 
 func (f *fakeBackend) ListPullRequestThreadComments(_ context.Context, _ string, _ string, number int) ([]domain.ActivityEvent, error) {
+	if f.threadPRCommentsErr != nil {
+		return nil, f.threadPRCommentsErr
+	}
 	return append([]domain.ActivityEvent(nil), f.threadReviewCommentsByPR[number]...), nil
 }
 
 func (f *fakeBackend) ListPullRequestThreadReviews(_ context.Context, _ string, _ string, number int) ([]domain.ActivityEvent, error) {
+	if f.threadPRReviewsErr != nil {
+		return nil, f.threadPRReviewsErr
+	}
 	return append([]domain.ActivityEvent(nil), f.threadReviewsByPR[number]...), nil
 }
 
@@ -318,6 +359,18 @@ func TestBoundedPRsForReviewFetchTruncatesAtBudget(t *testing.T) {
 	}
 }
 
+func TestBoundedPRsForReviewFetchAllowsZeroBudget(t *testing.T) {
+	t.Parallel()
+	prs := []domain.PRSnapshot{{Number: 1}, {Number: 2}}
+	got, truncated := boundedPRsForReviewFetch(prs, 0)
+	if !truncated {
+		t.Fatal("expected zero budget to truncate")
+	}
+	if len(got) != 0 {
+		t.Fatalf("expected no PRs with zero budget, got %#v", got)
+	}
+}
+
 func TestPrioritizePRsForReviewFetchBalancedPrefersNotificationAndViewerSignals(t *testing.T) {
 	t.Parallel()
 	prs := []domain.PRSnapshot{
@@ -422,6 +475,41 @@ func TestResolveCatchUpExpandOrder(t *testing.T) {
 
 	if _, err := resolveCatchUpExpandOrder(cfg, "watched"); err == nil {
 		t.Fatal("expected invalid override to fail")
+	}
+}
+
+func TestResolveCatchUpBudget(t *testing.T) {
+	t.Parallel()
+
+	cfg := config.Default()
+
+	got, err := resolveCatchUpBudget(cfg, 0)
+	if err != nil {
+		t.Fatalf("resolveCatchUpBudget default: %v", err)
+	}
+	if got != defaultCatchUpBudget() {
+		t.Fatalf("expected default budget %#v, got %#v", defaultCatchUpBudget(), got)
+	}
+
+	cfg.Defaults.CatchUp.ReviewBudget = 9
+	got, err = resolveCatchUpBudget(cfg, 0)
+	if err != nil {
+		t.Fatalf("resolveCatchUpBudget config: %v", err)
+	}
+	if got.MaxPRReviewFetches != 9 || got.MaxRecoveryFetches != defaultCatchUpBudget().MaxRecoveryFetches {
+		t.Fatalf("unexpected config-resolved budget: %#v", got)
+	}
+
+	got, err = resolveCatchUpBudget(cfg, 7)
+	if err != nil {
+		t.Fatalf("resolveCatchUpBudget override: %v", err)
+	}
+	if got.MaxPRReviewFetches != 7 || got.MaxRecoveryFetches != defaultCatchUpBudget().MaxRecoveryFetches {
+		t.Fatalf("unexpected resolved budget: %#v", got)
+	}
+
+	if _, err := resolveCatchUpBudget(cfg, -1); err == nil {
+		t.Fatal("expected negative review budget to fail")
 	}
 }
 
@@ -906,7 +994,7 @@ func TestCollectCatchUpForRepoNormalizesPRIssueThreadComments(t *testing.T) {
 		}},
 	}
 
-	entries, warnings := collectCatchUpForRepo(context.Background(), app{backend: backend}, "acme", "api", "2026-03-20T00:00:00Z", "adrian1-dot", false, false, false, false, false, "balanced", io.Discard)
+	entries, warnings := collectCatchUpForRepo(context.Background(), app{backend: backend}, "acme", "api", "2026-03-20T00:00:00Z", "adrian1-dot", false, false, false, false, false, "balanced", defaultCatchUpBudget(), io.Discard)
 
 	if len(warnings) != 0 {
 		t.Fatalf("unexpected warnings: %#v", warnings)
@@ -923,6 +1011,207 @@ func TestCollectCatchUpForRepoNormalizesPRIssueThreadComments(t *testing.T) {
 	}
 	if entry.LatestEvent != "commented" || entry.LatestActor != "adrian1-dot" {
 		t.Fatalf("unexpected latest event: %#v", entry)
+	}
+}
+
+func TestCollectCatchUpForRepoReviewBudgetDoesNotChangeBaseDataset(t *testing.T) {
+	t.Parallel()
+
+	reviewedAt := time.Date(2026, 4, 1, 12, 0, 0, 0, time.UTC)
+	backend := &fakeBackend{
+		viewer: "adrian1-dot",
+		prs: []domain.PRSnapshot{
+			{
+				Owner:              "acme",
+				Repo:               "api",
+				Number:             7,
+				Title:              "First PR",
+				URL:                "https://example.com/pr/7",
+				State:              "OPEN",
+				Author:             "alice",
+				UpdatedAt:          reviewedAt,
+				RequestedReviewers: []string{"adrian1-dot"},
+			},
+			{
+				Owner:     "acme",
+				Repo:      "api",
+				Number:    8,
+				Title:     "Second PR",
+				URL:       "https://example.com/pr/8",
+				State:     "OPEN",
+				Author:    "bob",
+				UpdatedAt: reviewedAt.Add(-time.Hour),
+			},
+		},
+		threadReviewsByPR: map[int][]domain.ActivityEvent{
+			7: {{
+				Repo:       "api",
+				Owner:      "acme",
+				Number:     7,
+				Kind:       "pull_request",
+				EventType:  "reviewed",
+				Actor:      "reviewer-a",
+				OccurredAt: reviewedAt,
+				Preview:    "review for first pr",
+			}},
+			8: {{
+				Repo:       "api",
+				Owner:      "acme",
+				Number:     8,
+				Kind:       "pull_request",
+				EventType:  "reviewed",
+				Actor:      "reviewer-b",
+				OccurredAt: reviewedAt,
+				Preview:    "review for second pr",
+			}},
+		},
+	}
+
+	defaultEntries, defaultWarnings := collectCatchUpForRepo(context.Background(), app{backend: backend}, "acme", "api", "2026-03-20T00:00:00Z", "adrian1-dot", false, false, false, false, false, "balanced", defaultCatchUpBudget(), io.Discard)
+	tightEntries, tightWarnings := collectCatchUpForRepo(context.Background(), app{backend: backend}, "acme", "api", "2026-03-20T00:00:00Z", "adrian1-dot", false, false, false, false, false, "balanced", catchUpBudget{MaxPRReviewFetches: 0, MaxRecoveryFetches: defaultCatchUpBudget().MaxRecoveryFetches}, io.Discard)
+
+	if len(defaultEntries) != 2 || len(tightEntries) != 2 {
+		t.Fatalf("expected identical base entry counts, got default=%#v tight=%#v", defaultEntries, tightEntries)
+	}
+
+	defaultByNumber := map[int]domain.CatchUpEntry{}
+	for _, entry := range defaultEntries {
+		defaultByNumber[entry.Number] = entry
+	}
+	tightByNumber := map[int]domain.CatchUpEntry{}
+	for _, entry := range tightEntries {
+		tightByNumber[entry.Number] = entry
+	}
+	for _, number := range []int{7, 8} {
+		baseDefault, ok := defaultByNumber[number]
+		if !ok {
+			t.Fatalf("missing default entry for %d", number)
+		}
+		baseTight, ok := tightByNumber[number]
+		if !ok {
+			t.Fatalf("missing tight entry for %d", number)
+		}
+		if baseDefault.Title != baseTight.Title || baseDefault.URL != baseTight.URL || baseDefault.State != baseTight.State {
+			t.Fatalf("base dataset drift for PR %d: default=%#v tight=%#v", number, baseDefault, baseTight)
+		}
+	}
+	if len(defaultWarnings) != 0 {
+		t.Fatalf("unexpected default warnings: %#v", defaultWarnings)
+	}
+	if len(tightWarnings) != 1 {
+		t.Fatalf("expected one truncation warning, got %#v", tightWarnings)
+	}
+	if !strings.Contains(tightWarnings[0], "review expansion truncated for acme/api") ||
+		!strings.Contains(tightWarnings[0], "base catch-up entries remain factual") ||
+		!strings.Contains(tightWarnings[0], "expanded review threads for 0 of 2 PRs") {
+		t.Fatalf("expected explicit zero-budget warning, got %#v", tightWarnings)
+	}
+}
+
+func TestFetchCatchUpRepoDataRateLimitWarningsExplainOmissions(t *testing.T) {
+	t.Parallel()
+
+	backend := &fakeBackend{
+		listRepoIssuesErr:        &github.Error{Kind: github.ErrRateLimited, Message: "issues limit"},
+		listRepoPRsErr:           &github.Error{Kind: github.ErrRateLimited, Message: "prs limit"},
+		listIssueCommentsErr:     &github.Error{Kind: github.ErrRateLimited, Message: "issue comments limit"},
+		listReviewCommentsErr:    &github.Error{Kind: github.ErrRateLimited, Message: "review comments limit"},
+		listRepoNotificationsErr: &github.Error{Kind: github.ErrRateLimited, Message: "notifications limit"},
+	}
+
+	data := fetchCatchUpRepoData(context.Background(), app{backend: backend}, "acme", "api", "2026-03-20T00:00:00Z", io.Discard)
+
+	if len(data.warnings) != 5 {
+		t.Fatalf("expected five warnings, got %#v", data.warnings)
+	}
+	expected := []string{
+		"issues for acme/api: rate limited; base report stays factual, but issue snapshots may be incomplete",
+		"prs for acme/api: rate limited; base report stays factual, but PR snapshots may be incomplete",
+		"issue comments for acme/api: rate limited; base report stays factual, but some issue-thread discussion may be omitted",
+		"review comments for acme/api: rate limited; base report stays factual, but some PR-thread discussion may be omitted",
+		"notifications for acme/api: rate limited; base report stays factual, but notification-driven involvement may be incomplete",
+	}
+	for _, want := range expected {
+		if !slices.Contains(data.warnings, want) {
+			t.Fatalf("missing warning %q in %#v", want, data.warnings)
+		}
+	}
+}
+
+func TestCollectWatchedItemEntryRateLimitWarningsExplainOmissions(t *testing.T) {
+	t.Parallel()
+
+	backend := &fakeBackend{
+		threadIssueCommentsErr: &github.Error{Kind: github.ErrRateLimited, Message: "issue comments limit"},
+		threadPRCommentsErr:    &github.Error{Kind: github.ErrRateLimited, Message: "pr comments limit"},
+		threadPRReviewsErr:     &github.Error{Kind: github.ErrRateLimited, Message: "pr reviews limit"},
+		getPRErr:               &github.Error{Kind: github.ErrRateLimited, Message: "pr state limit"},
+	}
+
+	_, warnings := collectWatchedItemEntry(context.Background(), app{backend: backend}, config.ItemWatch{
+		Alias:  "pr-12",
+		Owner:  "acme",
+		Repo:   "api",
+		Number: 12,
+		Kind:   "pr",
+	}, "2026-03-20T00:00:00Z", io.Discard)
+
+	expected := []string{
+		"pr issue comments for acme/api#12: rate limited; item summary stays factual, but some issue-thread discussion may be omitted",
+		"pr comments for acme/api#12: rate limited; item summary stays factual, but some PR-thread discussion may be omitted",
+		"pr reviews for acme/api#12: rate limited; item summary stays factual, but some review-thread activity may be omitted",
+		"pr state for acme/api#12: rate limited; item summary stays factual, but current PR state may be stale",
+	}
+	if len(warnings) != len(expected) {
+		t.Fatalf("expected %d warnings, got %#v", len(expected), warnings)
+	}
+	for _, want := range expected {
+		if !slices.Contains(warnings, want) {
+			t.Fatalf("missing warning %q in %#v", want, warnings)
+		}
+	}
+}
+
+func TestSummarizeCatchUpDiagnostics(t *testing.T) {
+	t.Parallel()
+
+	got := summarizeCatchUpDiagnostics([]string{
+		"review expansion truncated for acme/api: base catch-up entries remain factual; expanded review threads for 5 of 20 PRs",
+		"preview recovery truncated for acme/api after 10 fetches: entries remain factual, but some notification-only previews could not be recovered",
+		"issue comments for acme/api: rate limited; base report stays factual, but some issue-thread discussion may be omitted",
+		"issue comments for acme/api: rate limited; base report stays factual, but some issue-thread discussion may be omitted",
+		"viewer lookup failed; --me filtering may be incomplete",
+	})
+
+	want := []string{
+		"review expansion truncated",
+		"preview recovery truncated",
+		"issue comments rate-limited",
+		"viewer lookup failed; --me filtering may be incomplete",
+	}
+	if !slices.Equal(got, want) {
+		t.Fatalf("unexpected diagnostics summary: got %#v want %#v", got, want)
+	}
+}
+
+func TestFinalizeCatchUpDiagnosticsHidesDetailsByDefault(t *testing.T) {
+	t.Parallel()
+
+	report := domain.CatchUpReport{
+		Partial: true,
+		Warnings: []string{
+			"review expansion truncated for acme/api: base catch-up entries remain factual; expanded review threads for 5 of 20 PRs",
+			"issue comments for acme/api: rate limited; base report stays factual, but some issue-thread discussion may be omitted",
+		},
+	}
+
+	finalizeCatchUpDiagnostics(&report, false)
+
+	if !slices.Equal(report.DiagnosticsSummary, []string{"review expansion truncated", "issue comments rate-limited"}) {
+		t.Fatalf("unexpected diagnostics summary: %#v", report.DiagnosticsSummary)
+	}
+	if report.Warnings != nil {
+		t.Fatalf("expected detailed warnings to be hidden by default, got %#v", report.Warnings)
 	}
 }
 
